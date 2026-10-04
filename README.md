@@ -6,3 +6,9 @@ A simple WeGame laucncher for Linux.
 所有文件都会放在`~/.wegame-launcher`中；缓存文件放在`~/.cache/wegame-launcher`。
 
 ![](./pics/showcase.png)
+
+## 许可证
+
+- GPL v3
+
+- 项目内第三方图片资源版权归版权方所有
