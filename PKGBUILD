@@ -13,7 +13,7 @@ optdepends=(
     'mangohud: performance overlay'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('9b8052e30ba279254551987ab3e5ebcd1d21e4c3627647c03bf1bf179c1fe40c')
 
 package() {
     cd "$pkgname-$pkgver"

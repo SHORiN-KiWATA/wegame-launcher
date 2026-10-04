@@ -11,6 +11,6 @@ pkgbase = wegame-launcher
 	optdepends = gamescope: run WeGame nested in its own compositor
 	optdepends = mangohud: performance overlay
 	source = wegame-launcher-0.1.0.tar.gz::https://github.com/SHORiN-KiWATA/wegame-launcher/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = 9b8052e30ba279254551987ab3e5ebcd1d21e4c3627647c03bf1bf179c1fe40c
 
 pkgname = wegame-launcher
