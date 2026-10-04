@@ -1,0 +1,1509 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+"""Install and run Tencent WeGame in its own DW-Proton prefix.
+
+Reuses a Proton already on the machine (Steam, dwproton-bin, Lutris, ...) and
+downloads DW-Proton only when none is found. Everything lives in
+~/.wegame-launcher (runner, tools, prefix, update backups); downloads and logs
+go to ~/.cache/wegame-launcher. Without arguments a GTK window opens; see
+`wegame-launcher --help` for the command line.
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.request
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+APP_ID = "io.github.shorin_kiwata.WeGameLauncher"
+HOME = Path.home()
+ROOT = Path(os.environ.get("WEGAME_LAUNCHER_HOME", HOME / ".wegame-launcher"))
+PREFIX = ROOT / "prefix"  # STEAM_COMPAT_DATA_PATH; the Wine prefix is PREFIX/pfx
+PFX = PREFIX / "pfx"
+STEAM_DIR = ROOT / "steam"
+BACKUP_DIR = ROOT / "update-backups"
+INSTALL_DIR = PFX / "drive_c" / "Program Files (x86)" / "WeGame"
+CLIENT = INSTALL_DIR / "wegame.exe"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "wegame-launcher"
+DOWNLOADS = CACHE / "downloads"
+LOGS = CACHE / "logs"
+
+STALL_SECONDS = 120
+RETRIES = 5  # connection resets are common on long cross-border downloads
+USER_AGENT = "wegame-launcher"
+
+RUNNER_DIR = ROOT / "runner"  # DW-Proton downloaded by us
+TOOLS_DIR = ROOT / "tools"
+CONFIG = ROOT / "config.json"
+DW_RELEASE_API = "https://dawn.wine/api/v1/repos/dawn-winery/dwproton/releases/latest"
+
+# Official static 7-Zip, used only when the system has no 7z.
+SEVENZIP_URL = "https://www.7-zip.org/a/7z2603-linux-x64.tar.xz"
+SEVENZIP_SHA256 = "dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695"
+
+# WeGame's own website reads its download links from this config service; the
+# offline packages it lists under tgc/wegame/full/ need no Tencent downloader.
+WEGAME_CONFIG_API = "https://www.wegame.com.cn/api/rail/web/data_filter/game_config/query"
+WEGAME_CONFIG_BODY = {
+    "data_names": "wegame_home_configs",
+    "command": "list_all",
+    "params": {"items_per_pager": 50, "start_page": 0},
+    "stamp": {"agent_client_language": "zh_CN"},
+}
+WEGAME_FULL_RE = re.compile(
+    r"https://dldir1\.qq\.com/tgc/wegame/full/WeGame([0-9.]+)_[0-9_]+\(formal\)\.zip"
+)
+# Checksums of offline packages seen so far. A package missing here is still
+# accepted after a full CRC check of the zip.
+WEGAME_SHA256 = {
+    "5.9.2.2172": "767b7882760f85e41202fc4713d9e43338df659f82a228a4685a845013823f98",
+}
+WEGAME_FALLBACK = (
+    "5.9.2.2172",
+    "https://dldir1.qq.com/tgc/wegame/full/WeGame5.9.2.2172_0_0_3001(formal).zip",
+)
+
+# What the official installer writes besides copying files. It is a 32-bit
+# installer, so its HKLM\SOFTWARE keys land under Wow6432Node.
+REGISTRY = r"""REGEDIT4
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths\WeGame.exe]
+"InstallPath"="C:\\Program Files (x86)\\WeGame"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\App Paths\TGPClient.exe]
+"InstallPath"="C:\\Program Files (x86)\\WeGame\\wegame.exe"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\WeGameFormal]
+"DisplayName"="WeGame"
+"DisplayIcon"="C:\\Program Files (x86)\\WeGame\\wegame.exe"
+"UninstallString"="C:\\Program Files (x86)\\WeGame\\uninstall_complete.exe"
+"Publisher"="WeGame"
+
+[HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\TGPClient.exe]
+"InstallPath"="C:\\Program Files (x86)\\WeGame"
+"ExeFile"="C:\\Program Files (x86)\\WeGame\\wegame.exe"
+
+[HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\WeGame.exe]
+"InstallPath"="C:\\Program Files (x86)\\WeGame"
+
+[HKEY_CLASSES_ROOT\wegame]
+@="URL:wegame Protocol"
+"URL Protocol"=""
+
+[HKEY_CLASSES_ROOT\wegame\DefaultIcon]
+@="C:\\Program Files (x86)\\WeGame\\wegame.exe"
+
+[HKEY_CLASSES_ROOT\wegame\shell\open\command]
+@="\"C:\\Program Files (x86)\\WeGame\\wegame.exe\" \"%1\""
+
+; Not from the installer: hide Wine's fallback tray, a stray white window on
+; Wayland compositors without an XEmbed tray.
+[HKEY_CURRENT_USER\Software\Wine\Explorer]
+"ShowSystray"=dword:00000000
+"""
+
+ZH = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "").startswith("zh")
+
+
+def tr(zh: str, en: str) -> str:
+    return zh if ZH else en
+
+
+class LauncherError(Exception):
+    pass
+
+
+# Progress callback: (message, fraction in [0, 1] or None while unknown).
+def _quiet(message, fraction=None):
+    pass
+
+
+# ---------------------------------------------------------------- downloads
+
+
+def retrying(action):
+    """Run action(), retrying OSErrors with exponential backoff."""
+    for attempt in range(RETRIES):
+        try:
+            return action()
+        except OSError:
+            if attempt == RETRIES - 1:
+                raise
+            time.sleep(2 ** (attempt + 1))
+
+
+def http_get(url, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"User-Agent": USER_AGENT}
+    if data is not None:
+        headers["Content-Type"] = "application/json;charset=UTF-8"
+        headers["Referer"] = "https://www.wegame.com.cn/"
+
+    def fetch():
+        request = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read()
+
+    return retrying(fetch)
+
+
+def http_json(url, body=None):
+    return json.loads(http_get(url, body))
+
+
+def download(url, dest: Path, label, progress=_quiet):
+    """Download url to dest, resuming partial downloads across retries and runs."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+
+    def attempt():
+        offset = part.stat().st_size if part.exists() else 0
+        headers = {"User-Agent": USER_AGENT}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        request = urllib.request.Request(url, headers=headers)
+        # The timeout applies to each read, so it doubles as stall detection.
+        with urllib.request.urlopen(request, timeout=STALL_SECONDS) as response:
+            if offset and response.status != 206:
+                offset = 0
+            total = offset + int(response.headers.get("Content-Length") or 0)
+            done = offset
+            with open(part, "ab" if offset else "wb") as out:
+                while chunk := response.read(1 << 20):
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        progress(f"{label}  {done / 2**20:.0f} / {total / 2**20:.0f} MiB", done / total)
+
+    try:
+        retrying(attempt)
+    except OSError as exc:
+        raise LauncherError(tr(f"下载失败（再次安装会续传）：{url}\n{exc}", f"Download failed (installing again resumes): {url}\n{exc}"))
+    part.replace(dest)
+    return dest
+
+
+def file_digest(path: Path, algorithm, label, progress=_quiet):
+    digest = hashlib.new(algorithm)
+    size = path.stat().st_size or 1
+    done = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 22):
+            digest.update(chunk)
+            done += len(chunk)
+            progress(label, done / size)
+    return digest.hexdigest()
+
+
+# ------------------------------------------------------------------ runner
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(**changes):
+    config = {**load_config(), **changes}
+    ROOT.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def runner_label(proton: Path):
+    # Proton's version file reads "<timestamp> <name>".
+    try:
+        return (proton.parent / "version").read_text().split()[-1]
+    except (OSError, IndexError):
+        return proton.parent.name
+
+
+def steam_roots():
+    roots = [HOME / ".local/share/Steam", HOME / ".steam/steam", HOME / ".steam/root",
+             HOME / ".var/app/com.valvesoftware.Steam/data/Steam"]
+    libraries = []
+    for root in roots:
+        libraries.append(root)
+        try:
+            vdf = (root / "steamapps/libraryfolders.vdf").read_text(errors="replace")
+        except OSError:
+            continue
+        libraries += [Path(m) for m in re.findall(r'"path"\s+"([^"]+)"', vdf)]
+    return libraries
+
+
+def find_runners():
+    """Every Proton on the machine as {label: path}, ours first."""
+    patterns = [RUNNER_DIR / "*/proton",
+                Path("/usr/share/steam/compatibilitytools.d/*/proton"),
+                HOME / ".local/share/proton/runners/*/proton",  # shorin-proton-wrapper
+                HOME / ".local/share/lutris/runners/proton/*/proton",
+                HOME / ".local/share/lutris/runners/wine/*/proton",
+                HOME / ".config/heroic/tools/proton/*/proton"]
+    for root in steam_roots():
+        patterns += [root / "compatibilitytools.d/*/proton", root / "steamapps/common/Proton*/proton"]
+    found, seen = {}, set()
+    for pattern in patterns:
+        for proton in sorted(Path(pattern.anchor).glob(str(pattern.relative_to(pattern.anchor)))):
+            real = proton.resolve()
+            if proton.is_file() and real not in seen:
+                seen.add(real)
+                label = runner_label(proton)
+                found.setdefault(label if label not in found else f"{label} ({proton.parent})", proton)
+    return found
+
+
+def is_dwproton(label):
+    return "dwproton" in label.lower().replace("-", "")
+
+
+def auto_runner():
+    """The newest DW-Proton found anywhere, or None."""
+    dw = {label: path for label, path in find_runners().items() if is_dwproton(label)}
+    if not dw:
+        return None
+    return dw[max(dw, key=version_key)]
+
+
+def current_runner():
+    """The proton to use: WEGAME_LAUNCHER_PROTON, the user's pick, or the
+    newest DW-Proton found. None when nothing usable is installed."""
+    override = os.environ.get("WEGAME_LAUNCHER_PROTON")
+    if override:
+        return Path(override) if Path(override).is_file() else None
+    picked = load_config().get("runner")
+    if picked and Path(picked).is_file():
+        return Path(picked)
+    return auto_runner()
+
+
+def require_runner():
+    proton = current_runner()
+    if proton is None:
+        raise LauncherError(tr("没有可用的 Proton，请先安装", "No usable Proton; install first"))
+    return proton
+
+
+def runner_name():
+    proton = current_runner()
+    return runner_label(proton) if proton else "-"
+
+
+def download_dwproton(progress=_quiet):
+    """Download the latest DW-Proton into ~/.wegame-launcher/runner."""
+    progress(tr("正在查询 DW-Proton 最新版本…", "Looking up the latest DW-Proton…"), None)
+    try:
+        release = http_json(DW_RELEASE_API)
+    except (OSError, ValueError) as exc:
+        raise LauncherError(tr(f"无法获取 DW-Proton 版本信息：{exc}", f"Cannot fetch DW-Proton release info: {exc}"))
+    tag = release["tag_name"]
+    assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
+    archive = next((n for n in assets if n.endswith("x86_64.tar.xz")), None)
+    checksum = next((n for n in assets if n.endswith("x86_64.sha512sum")), None)
+    if not archive or not checksum:
+        raise LauncherError(tr(f"{tag} 缺少 x86_64 压缩包或校验文件", f"{tag} has no x86_64 archive or checksum"))
+    if (RUNNER_DIR / tag / "proton").is_file():
+        return RUNNER_DIR / tag / "proton"
+
+    tarball = download(assets[archive], DOWNLOADS / archive, tr(f"下载 {tag}", f"Downloading {tag}"), progress)
+    try:
+        expected = http_get(assets[checksum]).decode().split()[0]
+    except OSError as exc:
+        raise LauncherError(tr(f"无法获取 DW-Proton 校验值：{exc}", f"Cannot fetch the DW-Proton checksum: {exc}"))
+    if file_digest(tarball, "sha512", tr("校验 DW-Proton…", "Verifying DW-Proton…"), progress) != expected:
+        tarball.unlink()
+        raise LauncherError(tr("DW-Proton 校验失败，已删除，请重试", "DW-Proton checksum mismatch; removed, please retry"))
+
+    staging = RUNNER_DIR / f".{tag}.tmp"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    size = tarball.stat().st_size
+    with open(tarball, "rb") as raw, tarfile.open(fileobj=raw, mode="r|xz") as tar:
+        for member in tar:
+            tar.extract(member, staging, filter="tar")
+            progress(tr(f"解压 {tag}…", f"Extracting {tag}…"), raw.tell() / size)
+    proton = next(staging.glob("*/proton"), None)
+    if proton is None:
+        raise LauncherError(tr("DW-Proton 压缩包里没有 proton", "No proton script in the DW-Proton archive"))
+    shutil.rmtree(RUNNER_DIR / tag, ignore_errors=True)
+    proton.parent.rename(RUNNER_DIR / tag)
+    shutil.rmtree(staging)
+    tarball.unlink()
+    # Keep only the newest download; Protons from elsewhere are not ours to touch.
+    for old in RUNNER_DIR.iterdir():
+        if old.is_dir() and old.name != tag and not old.name.startswith("."):
+            shutil.rmtree(old, ignore_errors=True)
+    return RUNNER_DIR / tag / "proton"
+
+
+def ensure_runner(progress=_quiet):
+    return current_runner() or download_dwproton(progress)
+
+
+def choose_runner(choice):
+    """Remember a Proton by label or path; "auto" goes back to the newest DW-Proton."""
+    if choice == "auto":
+        save_config(runner=None)
+        return
+    runners = find_runners()
+    proton = runners.get(choice) or Path(choice).expanduser()
+    if proton.is_dir():
+        proton = proton / "proton"
+    if not proton.is_file():
+        raise LauncherError(tr(f"找不到这个 Proton：{choice}", f"No such Proton: {choice}"))
+    save_config(runner=str(proton.resolve()))
+
+
+def sevenzip(progress=_quiet):
+    """A 7z binary: the system's, or the official static build fetched once."""
+    for name in ("7z", "7zz", "7za"):
+        if path := shutil.which(name):
+            return path
+    binary = TOOLS_DIR / "7zzs"
+    if binary.is_file():
+        return str(binary)
+    archive = download(SEVENZIP_URL, DOWNLOADS / "7z-linux-x64.tar.xz", tr("下载 7-Zip", "Downloading 7-Zip"), progress)
+    if file_digest(archive, "sha256", tr("校验 7-Zip…", "Verifying 7-Zip…")) != SEVENZIP_SHA256:
+        archive.unlink()
+        raise LauncherError(tr("7-Zip 校验失败，已删除，请重试", "7-Zip checksum mismatch; removed, please retry"))
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive) as tar:
+        member = tar.getmember("7zzs")
+        member.name = binary.name
+        tar.extract(member, TOOLS_DIR, filter="tar")
+    archive.unlink()
+    binary.chmod(0o755)
+    return str(binary)
+
+
+def proton_env():
+    # Proton refuses to start unless both directories already exist.
+    PREFIX.mkdir(parents=True, exist_ok=True)
+    STEAM_DIR.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env.update(
+        STEAM_COMPAT_DATA_PATH=str(PREFIX),
+        STEAM_COMPAT_CLIENT_INSTALL_PATH=str(STEAM_DIR),
+        SteamAppId="0",
+        SteamGameId="0",
+        # Outside Steam, Proton's lsteamclient asserts on the missing native
+        # steamclient and wineboot hangs; the umu variables turn it off.
+        UMU_ID="wegame-launcher",
+        UMU_USE_STEAM="0",
+    )
+    # WeGame is 32-bit. In Wine's new WoW64 mode it runs through the 64-bit
+    # host libraries only, so no lib32 packages are needed; the old mode
+    # crashes outright when e.g. 32-bit libgcc_s is missing.
+    if load_config().get("wow64", True):
+        env.setdefault("PROTON_USE_WOW64", "1")
+    return env
+
+
+def proton_run(*args, log_name="setup.log"):
+    proton = require_runner()
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with open(LOGS / log_name, "a") as log:
+        log.write(f"\n--- {datetime.now():%F %T} proton {' '.join(args)}\n")
+        log.flush()
+        status = subprocess.call([str(proton), *args], env=proton_env(), stdout=log, stderr=log)
+    if status != 0:
+        raise LauncherError(tr(f"proton {args[0]} 失败（{status}），见 {LOGS / log_name}",
+                               f"proton {args[0]} failed ({status}), see {LOGS / log_name}"))
+
+
+# ------------------------------------------------------------------ wegame
+
+
+def wegame_package():
+    """(version, url) of the newest offline package Tencent lists."""
+    try:
+        data = http_json(WEGAME_CONFIG_API, WEGAME_CONFIG_BODY)
+        found = {m.group(1): m.group(0)
+                 for item in data.get("items", [])
+                 for m in WEGAME_FULL_RE.finditer(str(item.get("value", "")))}
+    except (OSError, ValueError):
+        found = {}
+    if not found:
+        return WEGAME_FALLBACK
+    version = max(found, key=version_key)
+    return version, found[version]
+
+
+def version_key(version):
+    return tuple(int(p) for p in re.findall(r"\d+", version))
+
+
+def fetch_wegame(progress=_quiet):
+    progress(tr("正在查询 WeGame 离线安装包…", "Looking up the WeGame offline package…"), None)
+    version, url = wegame_package()
+    dest = DOWNLOADS / f"WeGame-{version}.zip"
+    if not dest.exists():
+        download(url, dest, tr(f"下载 WeGame {version}", f"Downloading WeGame {version}"), progress)
+    label = tr("校验 WeGame 安装包…", "Verifying the WeGame package…")
+    expected = WEGAME_SHA256.get(version)
+    if expected:
+        ok = file_digest(dest, "sha256", label, progress) == expected
+    else:
+        progress(label, None)
+        try:
+            with zipfile.ZipFile(dest) as z:
+                ok = z.testzip() is None
+        except zipfile.BadZipFile:
+            ok = False
+    if not ok:
+        dest.unlink()
+        raise LauncherError(tr("WeGame 安装包校验失败，已删除，请重试", "WeGame package check failed; removed, please retry"))
+    return version, dest
+
+
+def run_7z(archive: Path, out: Path, label, progress=_quiet):
+    out.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        [sevenzip(progress), "x", "-y", "-aoa", "-bso0", "-bsp1", f"-o{out}", str(archive)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    buffer = b""
+    while chunk := proc.stdout.read(256):
+        buffer = (buffer + chunk)[-64:]
+        if found := re.findall(rb"(\d{1,3})%", buffer):
+            progress(label, int(found[-1]) / 100)
+    stderr = proc.stderr.read().decode(errors="replace")
+    # Both NSIS layers make 7z report "Headers Error" (exit 2) although every
+    # file is extracted; callers check for the files they need instead.
+    if proc.wait() not in (0, 2):
+        raise LauncherError(tr(f"解压失败：{archive.name}\n{stderr}", f"Extraction failed: {archive.name}\n{stderr}"))
+
+
+def extract_client(package: Path, progress=_quiet):
+    """Unpack the offline installer straight into the prefix, like the
+    installer itself would: overwrite files, never delete user data."""
+    stage = CACHE / "stage"
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
+    try:
+        progress(tr("解压安装包…", "Unpacking the package…"), None)
+        with zipfile.ZipFile(package) as z:
+            setup = next(n for n in z.namelist() if n.lower().endswith(".exe"))
+            z.extract(setup, stage)
+        run_7z(stage / setup, stage / "outer", tr("解压安装程序…", "Unpacking the installer…"), progress)
+        inner = stage / "outer" / "WeGameSetup.exe"
+        if not inner.is_file():
+            raise LauncherError(tr("安装包结构不对：缺少 WeGameSetup.exe", "Unexpected package layout: no WeGameSetup.exe"))
+        run_7z(inner, INSTALL_DIR, tr("安装 WeGame 文件…", "Installing WeGame files…"), progress)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    if not CLIENT.is_file():
+        raise LauncherError(tr("解压后没有找到 wegame.exe", "wegame.exe missing after extraction"))
+    # Installer plugins, kernel drivers (useless under Wine) and the stale
+    # *_temp_ copies the installer deletes itself.
+    for junk in ("$PLUGINSDIR", "$SYSDIR"):
+        shutil.rmtree(INSTALL_DIR / junk, ignore_errors=True)
+    for temp in INSTALL_DIR.rglob("*_temp_"):
+        temp.unlink()
+
+
+def import_registry(progress=_quiet):
+    progress(tr("写入注册表…", "Writing registry entries…"), None)
+    reg = CACHE / "wegame.reg"
+    reg.write_text(REGISTRY.replace("\n", "\r\n"), encoding="ascii")
+    proton_run("run", "regedit", "/S", "Z:" + str(reg).replace("/", "\\"))
+
+
+def client_version():
+    try:
+        text = (INSTALL_DIR / "mmog_data.xml").read_text(encoding="gb18030")
+    except OSError:
+        return None
+    match = re.search(r"<Version>([0-9.]+)</Version>", text)
+    return match.group(1) if match else None
+
+
+def is_installed():
+    return CLIENT.is_file() and current_runner() is not None
+
+
+# ------------------------------------------------------- update recovery
+
+
+def ini_value(path: Path, key):
+    for line in path.read_text(errors="replace").splitlines():
+        if line.startswith(key + "="):
+            return line[len(key) + 1:].strip()
+    return None
+
+
+def finish_failed_update(status: Path, payload: Path):
+    """WeGame downloads updates next to the client and records the result in
+    update.tmp. Under Wine the final move can fail and leave the complete
+    payload with OverwriteStatus set and TickMoveFile=-1; finish that move,
+    backing up every replaced file."""
+    if not (status.is_file() and payload.is_dir()):
+        return
+    overwrite = ini_value(status, "OverwriteStatus")
+    if overwrite in (None, "", "0") or ini_value(status, "TickMoveFile") != "-1":
+        return  # Not the known failure: WeGame's own updater handles it.
+    files = []
+    for path in payload.rglob("*"):
+        if path.is_symlink() or not (path.is_file() or path.is_dir()):
+            raise LauncherError(tr(f"更新包里有链接或特殊文件，已拒绝：{path}", f"Refusing update payload with links or special files: {path}"))
+        if path.is_file() and path.relative_to(payload) != Path("repo_update.ini"):
+            files.append(path.relative_to(payload))
+
+    name = str(payload.relative_to(INSTALL_DIR)).replace("/", "_")
+    backup = BACKUP_DIR / f"{datetime.now():%Y%m%d-%H%M%S}-{name}"
+    for rel in files:
+        dest = INSTALL_DIR / rel
+        if dest.is_file():
+            (backup / "replaced" / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dest, backup / "replaced" / rel)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        temp = dest.with_name(dest.name + ".wegame-launcher-new")
+        shutil.copy2(payload / rel, temp)
+        temp.replace(dest)
+    backup.mkdir(parents=True, exist_ok=True)
+    payload.rename(backup / "payload")
+    status.rename(backup / "update.tmp")
+
+
+def recover_updates():
+    if not INSTALL_DIR.is_dir():
+        return
+    finish_failed_update(INSTALL_DIR / "update.tmp", INSTALL_DIR / "wegame_update")
+    for slot in sorted(INSTALL_DIR.glob("multi_group/*/*")):
+        finish_failed_update(slot / "update.tmp", slot / "update_files")
+
+
+# --------------------------------------------------------------- processes
+
+
+def prefix_pids():
+    """PIDs of every process (wineserver included) running in our prefix."""
+    markers = {f"STEAM_COMPAT_DATA_PATH={PREFIX}".encode(), f"WINEPREFIX={PFX}".encode()}
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            environ = (entry / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if markers.intersection(environ):
+            pids.append(int(entry.name))
+    return pids
+
+
+def is_running():
+    return bool(prefix_pids())
+
+
+def stop_prefix():
+    """Shut the prefix down after setup steps: Wine's helper services would
+    otherwise linger and make WeGame look like it is running."""
+    proton = current_runner()
+    if proton is None:
+        return
+    wineserver = proton.parent / "files" / "bin" / "wineserver"
+    env = {**proton_env(), "WINEPREFIX": str(PFX)}
+    try:
+        subprocess.run([str(wineserver), "-k"], env=env, timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([str(wineserver), "-w"], env=env, timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    kill_all()
+
+
+NO_RELAUNCH = ROOT / ".no-relaunch"
+
+
+def kill_all():
+    # Tells a supervising launcher not to restart what the user just killed.
+    ROOT.mkdir(parents=True, exist_ok=True)
+    NO_RELAUNCH.touch()
+    pids = prefix_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return len(pids)
+
+
+# ----------------------------------------------------------------- actions
+
+
+class InstallLock:
+    def __enter__(self):
+        ROOT.mkdir(parents=True, exist_ok=True)
+        self.file = open(ROOT / ".lock", "w")
+        try:
+            fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LauncherError(tr("另一个安装任务正在进行", "Another install is already running"))
+        return self
+
+    def __exit__(self, *exc):
+        self.file.close()
+
+
+def _install(progress, force_client=False):
+    """Runner, prefix, client and registry; finished steps are skipped."""
+    ensure_runner(progress)
+    if not (PFX / "drive_c").is_dir():
+        progress(tr("初始化前缀（首次需要几分钟）…", "Creating the prefix (takes a few minutes)…"), None)
+        proton_run("run", "wineboot", "-u")
+        stop_prefix()
+    if force_client or not CLIENT.is_file():
+        _, package = fetch_wegame(progress)
+        extract_client(package, progress)
+        import_registry(progress)
+        # WeGame cannot be running here: the client was missing, or
+        # reinstall refused to start while it ran.
+        stop_prefix()
+
+
+def install(progress=_quiet):
+    with InstallLock():
+        _install(progress)
+        progress(tr("安装完成", "Installed"), 1.0)
+
+
+def reinstall(progress=_quiet):
+    """Unpack the client again over the existing one; login data stays."""
+    if is_running():
+        raise LauncherError(tr("WeGame 正在运行，请先强制退出", "WeGame is running; force quit it first"))
+    with InstallLock():
+        _install(progress, force_client=True)
+        progress(tr("重新安装完成", "Reinstalled"), 1.0)
+
+
+def rebuild(progress=_quiet):
+    """Throw the whole prefix away (including WeGame login data) and start over."""
+    with InstallLock():
+        kill_all()
+        progress(tr("删除旧前缀…", "Removing the old prefix…"), None)
+        shutil.rmtree(PREFIX, ignore_errors=True)
+        _install(progress)
+        progress(tr("重建完成", "Rebuilt"), 1.0)
+
+
+GAMESCOPE_DEFAULTS = {"enabled": False, "fullscreen": False, "resolution": "", "fps": "", "fsr": False, "args": ""}
+
+
+def gamescope_settings():
+    return {**GAMESCOPE_DEFAULTS, **load_config().get("gamescope", {})}
+
+
+def set_gamescope(**changes):
+    save_config(gamescope={**gamescope_settings(), **changes})
+
+
+def gamescope_command():
+    """gamescope [options] -- prefix, or [] when disabled. Running WeGame
+    nested in its own compositor sidesteps the compositor-specific window
+    problems of its layered login and main windows."""
+    settings = gamescope_settings()
+    if not settings["enabled"]:
+        return []
+    binary = shutil.which("gamescope")
+    if not binary:
+        raise LauncherError(tr("已开启 Gamescope，但没有安装 gamescope", "Gamescope is enabled but not installed"))
+    command = [binary]
+    if settings["fullscreen"]:
+        command.append("-f")
+    if settings["resolution"]:
+        match = re.fullmatch(r"(\d+)x(\d+)", settings["resolution"])
+        if not match:
+            raise LauncherError(tr(f"分辨率格式应为 宽x高：{settings['resolution']}", f"Resolution must be WxH: {settings['resolution']}"))
+        width, height = match.groups()
+        # Same size inside and out, so WeGame renders 1:1 in the window.
+        command += ["-w", width, "-h", height, "-W", width, "-H", height]
+    if settings["fps"]:
+        command += ["-r", str(settings["fps"])]
+    if settings["fsr"]:
+        command += ["-F", "fsr"]
+    try:
+        command += shlex.split(settings["args"])
+    except ValueError as exc:
+        raise LauncherError(tr(f"Gamescope 参数有误：{exc}", f"Invalid Gamescope arguments: {exc}"))
+    return command + ["--"]
+
+
+def launch(args=()):
+    """Start WeGame detached and return its Popen."""
+    if not is_installed():
+        raise LauncherError(tr("WeGame 还没有安装", "WeGame is not installed"))
+    # A second launch while WeGame runs (e.g. a wegame:// link) must not
+    # touch files the running client has open.
+    if not is_running():
+        recover_updates()
+    LOGS.mkdir(parents=True, exist_ok=True)
+    log = open(LOGS / "wegame.log", "a")
+    log.write(f"\n--- {datetime.now():%F %T} launch\n")
+    log.flush()
+    command = [*gamescope_command(), str(require_runner()), "waitforexitandrun", str(CLIENT), *args]
+    env = proton_env()
+    if load_config().get("mangohud"):
+        if not shutil.which("mangohud"):
+            raise LauncherError(tr("已开启 MangoHud，但没有安装 mangohud", "MangoHud is enabled but not installed"))
+        env["MANGOHUD"] = "1"  # DXVK's Vulkan picks up the MangoHud layer
+    with log:
+        return subprocess.Popen(command, env=env, cwd=INSTALL_DIR, stdout=log, stderr=log,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+MAX_RELAUNCHES = 3
+
+
+def update_payload_pending():
+    """Downloaded update files still waiting next to the client."""
+    return (INSTALL_DIR / "wegame_update").is_dir() or any(INSTALL_DIR.glob("multi_group/*/*/update_files"))
+
+
+def wait_prefix_idle(timeout=60):
+    deadline = time.monotonic() + timeout
+    while prefix_pids():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(1)
+    return True
+
+
+def run_supervised(args=(), notify=lambda message: None):
+    """Launch WeGame and wait for it. WeGame quits after downloading an
+    update and expects its updater to swap the files and start it again;
+    under Proton that restart never happens, so do it here."""
+    if is_running():  # e.g. a wegame:// link while WeGame is open
+        return launch(args).wait()
+    status = 0
+    for attempt in range(MAX_RELAUNCHES + 1):
+        version = client_version()
+        NO_RELAUNCH.unlink(missing_ok=True)
+        status = launch(args).wait()
+        # The main process can exit while helpers finish; still busy after
+        # a minute means WeGame restarted itself and needs no help.
+        if not wait_prefix_idle() or NO_RELAUNCH.exists():
+            break
+        # A plain exit also leaves a status-only update.tmp behind, so only
+        # a waiting payload or a changed version counts as an update.
+        if not (update_payload_pending() or client_version() != version):
+            break
+        if attempt == MAX_RELAUNCHES:
+            notify(tr("WeGame 连续多次因更新退出，已停止自动重启", "WeGame kept exiting for updates; stopped restarting it"))
+            break
+        notify(tr("WeGame 已下载更新，正在重新启动…", "WeGame downloaded an update; restarting it…"))
+        args = ()  # a wegame:// link was for the first start only
+    return status
+
+
+def open_folder():
+    ROOT.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(["xdg-open", str(ROOT)], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --------------------------------------------------------------------- GUI
+
+
+# Same palette source as shorin-proton-wrapper-manager: the user's colors.css
+# (e.g. from matugen) supplies the accent colors.
+GUI_CSS = b"""
+.logo-text {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+.status {
+  color: alpha(@theme_fg_color, 0.62);
+}
+.status-error {
+  color: @error_color;
+}
+.run-button, .kill-button, .plain-button {
+  min-height: 40px;
+  border-radius: 12px;
+  background-image: none;
+  box-shadow: none;
+}
+.plain-button {
+  background-color: alpha(@theme_fg_color, 0.06);
+  border-color: alpha(@theme_fg_color, 0.12);
+}
+.plain-button:hover, .compact-button:hover {
+  background-color: alpha(@theme_fg_color, 0.11);
+}
+.compact-danger {
+  color: @error_color;
+}
+.compact-button {
+  min-height: 30px;
+  padding: 2px 14px;
+  border-radius: 10px;
+  background-image: none;
+  box-shadow: none;
+  background-color: alpha(@theme_fg_color, 0.06);
+  border-color: alpha(@theme_fg_color, 0.12);
+}
+.run-button {
+  background-color: alpha(@accent_bg_color, 0.18);
+  border-color: alpha(@accent_bg_color, 0.36);
+  color: @theme_fg_color;
+}
+.run-button:hover {
+  background-color: alpha(@accent_bg_color, 0.34);
+  border-color: alpha(@accent_bg_color, 0.58);
+}
+.run-button:active {
+  background-color: alpha(@accent_bg_color, 0.46);
+}
+.kill-button {
+  background-color: alpha(@error_color, 0.10);
+  border-color: alpha(@error_color, 0.30);
+  color: @theme_fg_color;
+}
+.kill-button:hover {
+  background-color: alpha(@error_color, 0.22);
+}
+.icon-button {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 999px;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  outline-offset: 0;
+  color: alpha(@theme_fg_color, 0.70);
+}
+.icon-button:hover {
+  background-color: alpha(@theme_fg_color, 0.08);
+  color: @theme_fg_color;
+}
+.settings-card {
+  background-color: alpha(@theme_fg_color, 0.045);
+  border: 1px solid alpha(@theme_fg_color, 0.08);
+  border-radius: 14px;
+  padding: 6px 14px;
+}
+.settings-row {
+  min-height: 44px;
+}
+.settings-row + .settings-row {
+  border-top: 1px solid alpha(@theme_fg_color, 0.07);
+}
+.card-title {
+  font-weight: 700;
+  margin: 4px 4px 0;
+}
+.dim {
+  color: alpha(@theme_fg_color, 0.55);
+  font-size: 0.9em;
+}
+entry, dropdown > button {
+  border-radius: 10px;
+}
+entry.invalid {
+  border-color: @error_color;
+}
+progressbar trough {
+  background-color: alpha(@theme_fg_color, 0.12);
+  border-radius: 999px;
+  min-height: 6px;
+}
+progressbar trough progress {
+  background-color: @accent_bg_color;
+  background-image: none;
+  border-color: @accent_bg_color;
+  border-radius: 999px;
+}
+switch:checked {
+  background-color: @accent_bg_color;
+  background-image: none;
+}
+button:focus-visible, entry:focus-within, switch:focus-visible {
+  outline-color: alpha(@theme_fg_color, 0.28);
+  outline-style: solid;
+  outline-width: 1px;
+  outline-offset: -2px;
+  box-shadow: none;
+}
+"""
+
+
+def prefer_dark_theme():
+    try:
+        result = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                                capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    return "prefer-dark" in result.stdout
+
+
+def user_gtk_colors():
+    colors = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "gtk-4.0" / "colors.css"
+    try:
+        return colors.read_bytes() + b"\n"
+    except OSError:
+        return b""
+
+
+def run_gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
+
+    def install_style():
+        settings = Gtk.Settings.get_default()
+        if settings:
+            settings.set_property("gtk-application-prefer-dark-theme", prefer_dark_theme())
+        provider = Gtk.CssProvider()
+        provider.load_from_data(user_gtk_colors() + GUI_CSS, -1)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def icon_button(icon, tooltip, callback):
+        button = Gtk.Button(icon_name=icon, tooltip_text=tooltip, css_classes=["icon-button"])
+        button.connect("clicked", lambda *_: callback())
+        return button
+
+    def settings_row(title, subtitle, widget):
+        row = Gtk.Box(spacing=12, css_classes=["settings-row"])
+        labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
+        labels.append(Gtk.Label(label=title, xalign=0))
+        if subtitle:
+            labels.append(Gtk.Label(label=subtitle, xalign=0, wrap=True, css_classes=["dim"]))
+        widget.set_valign(Gtk.Align.CENTER)
+        row.append(labels)
+        row.append(widget)
+        return row
+
+    def card(title, rows):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.append(Gtk.Label(label=title, xalign=0, css_classes=["card-title"]))
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-card"])
+        for row in rows:
+            inner.append(row)
+        box.append(inner)
+        return box
+
+    def wegame_icon():
+        """WeGame's own icon once the client is installed."""
+        ico = INSTALL_DIR / "tpf_ui" / "res" / "app_icon.ico"
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(ico), 72, 72, True)
+        except GLib.Error:
+            return None
+        return Gdk.Texture.new_for_pixbuf(pixbuf)
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="WeGame Launcher", default_width=480, default_height=360)
+            # An empty title bar keeps GTK's own window frame (corners, shadow,
+            # resize edges) without showing a header; tiling compositors like
+            # niri round and border the window themselves.
+            self.set_titlebar(Gtk.Box(visible=False))
+            self.busy = False
+            self.error = None
+
+            self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT,
+                                   vhomogeneous=False, interpolate_size=True)
+            self.stack.add_named(self.build_main(), "main")
+            self.stack.add_named(self.build_settings(), "settings")
+
+            body = Gtk.Overlay()
+            body.set_child(self.stack)
+            close = icon_button("window-close-symbolic", tr("关闭", "Close"), self.close)
+            close.set_halign(Gtk.Align.END)
+            close.set_valign(Gtk.Align.START)
+            close.set_margin_top(10)
+            close.set_margin_end(10)
+            body.add_overlay(close)
+
+            # No title bar: dragging anywhere on the window moves it.
+            self.set_child(Gtk.WindowHandle(child=body))
+
+            keys = Gtk.EventControllerKey()
+            keys.connect("key-pressed", self.on_key)
+            self.add_controller(keys)
+
+            self.refresh()
+            GLib.timeout_add_seconds(2, self.refresh)
+
+        # ------------------------------------------------------------ main
+        def build_main(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, width_request=400,
+                          halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+                          margin_top=34, margin_bottom=18, margin_start=28, margin_end=28)
+            logo = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, halign=Gtk.Align.CENTER)
+            self.logo_image = Gtk.Image(pixel_size=72, visible=False)
+            logo.append(self.logo_image)
+            logo.append(Gtk.Label(label="WeGame", css_classes=["logo-text"]))
+            box.append(logo)
+
+            self.status = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, css_classes=["status"])
+            box.append(self.status)
+            self.progress = Gtk.ProgressBar(visible=False, margin_top=4)
+            box.append(self.progress)
+
+            self.install_button = Gtk.Button(label=tr("安装 WeGame", "Install WeGame"), css_classes=["run-button"])
+            self.install_button.connect("clicked", lambda *_: self.start_task(install))
+            box.append(self.install_button)
+
+            self.launch_button = Gtk.Button(label=tr("启动 WeGame", "Launch WeGame"), css_classes=["run-button"], hexpand=True)
+            self.launch_button.connect("clicked", self.on_launch)
+            self.kill_button = Gtk.Button(label=tr("强制退出", "Force quit"), css_classes=["kill-button"], hexpand=True)
+            self.kill_button.connect("clicked", self.on_kill)
+            self.run_box = Gtk.Box(spacing=10, homogeneous=True)
+            self.run_box.append(self.launch_button)
+            self.run_box.append(self.kill_button)
+            box.append(self.run_box)
+
+            tools = Gtk.Box(spacing=4, halign=Gtk.Align.CENTER, margin_top=2)
+            tools.append(icon_button("folder-open-symbolic", tr("打开前缀目录", "Open prefix folder"), open_folder))
+            self.settings_button = icon_button("emblem-system-symbolic", tr("设置", "Settings"), self.show_settings)
+            tools.append(self.settings_button)
+            box.append(tools)
+            return box
+
+        # -------------------------------------------------------- settings
+        def build_settings(self):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, width_request=420,
+                           halign=Gtk.Align.CENTER, vexpand=True,
+                           margin_top=14, margin_bottom=14, margin_start=20, margin_end=20)
+            header = Gtk.Box(spacing=6)
+            header.append(icon_button("go-previous-symbolic", tr("返回", "Back"), self.show_main))
+            header.append(Gtk.Label(label=tr("设置", "Settings"), css_classes=["heading"]))
+            page.append(header)
+
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+            scroller = Gtk.ScrolledWindow(child=content, hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
+            page.append(scroller)
+
+            # Proton
+            self.runner_dropdown = Gtk.DropDown(hexpand=True)
+            self.runner_dropdown.connect("notify::selected", self.on_runner_selected)
+            download = Gtk.Button(label=tr("下载", "Download"), css_classes=["compact-button"])
+            download.connect("clicked", self.on_download_runner)
+            self.wow64_switch = Gtk.Switch()
+            self.wow64_switch.connect("notify::active", lambda s, _: save_config(wow64=s.get_active()))
+            content.append(card("Proton", [
+                settings_row(tr("运行器", "Runner"), None, self.runner_dropdown),
+                settings_row(tr("WoW64 模式", "WoW64 mode"), tr("不需要 32 位系统库", "No 32-bit system libraries needed"), self.wow64_switch),
+                settings_row("DW-Proton", tr("下载最新版本", "Get the latest release"), download),
+            ]))
+
+            # Overlays and compositor
+            self.mangohud_switch = Gtk.Switch()
+            self.mangohud_switch.connect("notify::active", lambda s, _: save_config(mangohud=s.get_active()))
+            self.gs_switch = Gtk.Switch()
+            self.gs_switch.connect("notify::active", self.on_gamescope_toggled)
+            self.gs_fullscreen = Gtk.Switch()
+            self.gs_fullscreen.connect("notify::active", lambda s, _: set_gamescope(fullscreen=s.get_active()))
+            self.gs_fsr = Gtk.Switch()
+            self.gs_fsr.connect("notify::active", lambda s, _: set_gamescope(fsr=s.get_active()))
+            self.gs_res = Gtk.Entry(placeholder_text="1600x900", width_chars=11)
+            self.gs_res.connect("changed", self.on_entry, "resolution", r"(\d+x\d+)?")
+            self.gs_fps = Gtk.Entry(placeholder_text=tr("不限", "none"), width_chars=11)
+            self.gs_fps.connect("changed", self.on_entry, "fps", r"\d*")
+            self.gs_args = Gtk.Entry(placeholder_text="--force-grab-cursor", hexpand=True)
+            self.gs_args.connect("changed", self.on_entry, "args", None)
+            self.gs_rows = [
+                settings_row(tr("全屏", "Fullscreen"), tr("默认是窗口模式", "Windowed by default"), self.gs_fullscreen),
+                settings_row(tr("分辨率", "Resolution"), tr("宽x高，留空用默认", "WxH, empty for default"), self.gs_res),
+                settings_row(tr("帧率上限", "Frame limit"), None, self.gs_fps),
+                settings_row("FSR", tr("超分辨率", "Upscaling"), self.gs_fsr),
+                settings_row(tr("附加参数", "Extra arguments"), None, self.gs_args),
+            ]
+            self.mangohud_row = settings_row("MangoHud", tr("性能叠加层", "Performance overlay"), self.mangohud_switch)
+            self.gs_row = settings_row("Gamescope", tr("在独立的合成器里运行，可解决窗口异常",
+                                                      "Run nested in its own compositor; fixes window glitches"), self.gs_switch)
+            content.append(card(tr("显示", "Display"), [self.mangohud_row, self.gs_row, *self.gs_rows]))
+
+            # Maintenance
+            reinstall_button = Gtk.Button(label=tr("重装", "Reinstall"), css_classes=["compact-button"])
+            reinstall_button.connect("clicked", self.on_reinstall)
+            rebuild_button = Gtk.Button(label=tr("重建", "Rebuild"), css_classes=["compact-button", "compact-danger"])
+            rebuild_button.connect("clicked", self.on_rebuild)
+            self.maintenance = card(tr("维护", "Maintenance"), [
+                settings_row(tr("重新安装 WeGame", "Reinstall WeGame"), tr("保留登录数据和设置", "Keeps login data and settings"), reinstall_button),
+                settings_row(tr("重建前缀", "Rebuild prefix"), tr("清空全部数据后重新安装", "Wipes everything and installs again"), rebuild_button),
+            ])
+            content.append(self.maintenance)
+            return page
+
+        def load_settings(self):
+            """Fill the settings page from config; Protons are rescanned each time."""
+            self.loading = True
+            self.runners = [None, *find_runners().values()]
+            labels = [tr("自动（最新的 DW-Proton）", "Auto (newest DW-Proton)"),
+                      *(runner_label(p) for p in self.runners[1:])]
+            self.runner_dropdown.set_model(Gtk.StringList.new(labels))
+            picked = load_config().get("runner")
+            index = next((i for i, p in enumerate(self.runners) if p and str(p.resolve()) == picked), 0)
+            self.runner_dropdown.set_selected(index)
+
+            config = load_config()
+            self.wow64_switch.set_active(config.get("wow64", True))
+            has_mangohud = shutil.which("mangohud") is not None
+            self.mangohud_switch.set_active(bool(config.get("mangohud")) and has_mangohud)
+            self.mangohud_row.set_sensitive(has_mangohud)
+            self.mangohud_row.set_tooltip_text(None if has_mangohud else tr("没有安装 mangohud", "mangohud is not installed"))
+
+            gs = gamescope_settings()
+            has_gamescope = shutil.which("gamescope") is not None
+            self.gs_row.set_sensitive(has_gamescope)
+            self.gs_row.set_tooltip_text(None if has_gamescope else tr("没有安装 gamescope", "gamescope is not installed"))
+            self.gs_switch.set_active(gs["enabled"] and has_gamescope)
+            self.gs_fullscreen.set_active(gs["fullscreen"])
+            self.gs_fsr.set_active(gs["fsr"])
+            self.gs_res.set_text(gs["resolution"])
+            self.gs_fps.set_text(str(gs["fps"]))
+            self.gs_args.set_text(gs["args"])
+            for row in self.gs_rows:
+                row.set_sensitive(self.gs_switch.get_active())
+            self.maintenance.set_sensitive(is_installed())
+            self.loading = False
+
+        def on_runner_selected(self, dropdown, _):
+            if getattr(self, "loading", False):
+                return
+            proton = self.runners[dropdown.get_selected()]
+            save_config(runner=str(proton.resolve()) if proton else None)
+
+        def on_gamescope_toggled(self, switch, _):
+            for row in self.gs_rows:
+                row.set_sensitive(switch.get_active())
+            if not getattr(self, "loading", False):
+                set_gamescope(enabled=switch.get_active())
+
+        def on_entry(self, entry, key, pattern):
+            if getattr(self, "loading", False):
+                return
+            text = entry.get_text().strip()
+            if key == "args":
+                try:
+                    shlex.split(text)
+                    valid = True
+                except ValueError:
+                    valid = False
+            else:
+                valid = re.fullmatch(pattern, text) is not None
+            if valid:
+                entry.remove_css_class("invalid")
+                set_gamescope(**{key: text})
+            else:
+                entry.add_css_class("invalid")
+
+        def show_settings(self):
+            self.load_settings()
+            self.stack.set_visible_child_name("settings")
+
+        def show_main(self):
+            self.stack.set_visible_child_name("main")
+            self.refresh()
+
+        def on_key(self, _controller, keyval, _code, _state):
+            if keyval == Gdk.KEY_Escape and self.stack.get_visible_child_name() == "settings":
+                self.show_main()
+                return True
+            return False
+
+        # ----------------------------------------------------------- state
+        def refresh(self):
+            if self.busy:
+                return True
+            installed = is_installed()
+            running = installed and is_running()
+            self.install_button.set_visible(not installed)
+            self.run_box.set_visible(installed)
+            self.settings_button.set_sensitive(True)
+            self.launch_button.set_sensitive(not running)
+            self.kill_button.set_sensitive(running)
+            self.progress.set_visible(False)
+            if installed and not self.logo_image.get_visible():
+                texture = wegame_icon()
+                if texture:
+                    self.logo_image.set_from_paintable(texture)
+                    self.logo_image.set_visible(True)
+            if self.error:
+                self.set_status(self.error, error=True)
+            elif not installed:
+                if current_runner():
+                    self.set_status(tr(f"将使用 {runner_name()}，并下载 WeGame 官方离线安装包",
+                                       f"Uses {runner_name()} and downloads the official WeGame offline package"))
+                else:
+                    self.set_status(tr("将下载 DW-Proton 和 WeGame 官方离线安装包",
+                                       "Downloads DW-Proton and the official WeGame offline package"))
+            elif running:
+                self.set_status(tr("WeGame 运行中", "WeGame is running"))
+            else:
+                extras = [name for name, on in (("Gamescope", gamescope_settings()["enabled"]),
+                                                ("MangoHud", load_config().get("mangohud"))) if on]
+                self.set_status(" · ".join([f"WeGame {client_version() or '?'}", runner_name(), *extras]))
+            return True
+
+        def set_status(self, text, error=False):
+            self.status.set_text(text)
+            (self.status.add_css_class if error else self.status.remove_css_class)("status-error")
+
+        def set_progress(self, message, fraction):
+            self.set_status(message)
+            if fraction is None:
+                self.progress.pulse()
+            else:
+                self.progress.set_fraction(fraction)
+            return False
+
+        def start_task(self, task):
+            self.show_main()
+            self.busy = True
+            self.error = None
+            self.install_button.set_visible(False)
+            self.run_box.set_visible(False)
+            self.settings_button.set_sensitive(False)
+            self.progress.set_visible(True)
+            self.progress.set_fraction(0)
+            last = [0.0]
+
+            def progress(message, fraction=None):
+                # Tar and 7z report per file; don't flood the main loop.
+                now = time.monotonic()
+                if fraction is None or fraction >= 1 or now - last[0] > 0.1:
+                    last[0] = now
+                    GLib.idle_add(self.set_progress, message, fraction)
+
+            def worker():
+                try:
+                    task(progress)
+                    error = None
+                except LauncherError as exc:
+                    error = str(exc)
+                except Exception as exc:  # Show anything unexpected instead of hanging.
+                    error = f"{type(exc).__name__}: {exc}"
+                GLib.idle_add(self.task_done, error)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def task_done(self, error):
+            self.busy = False
+            self.error = error
+            if error:
+                self.install_button.set_label(tr("重试", "Retry"))
+            self.refresh()
+            return False
+
+        # --------------------------------------------------------- actions
+        def on_launch(self, *_):
+            self.error = None
+            self.launch_button.set_sensitive(False)
+            self.set_status(tr("正在启动 WeGame…", "Starting WeGame…"))
+
+            def supervise():
+                try:
+                    run_supervised(notify=lambda message: GLib.idle_add(self.set_status, message))
+                except LauncherError as exc:
+                    GLib.idle_add(self.launch_failed, str(exc))
+
+            threading.Thread(target=supervise, daemon=True).start()
+
+        def launch_failed(self, error):
+            self.error = error
+            self.refresh()
+            return False
+
+        def on_kill(self, *_):
+            self.error = None
+            count = kill_all()
+            self.set_status(tr(f"已结束 {count} 个进程", f"Killed {count} processes"))
+
+        def confirm(self, message, callback):
+            dialog = Gtk.AlertDialog(message=message, buttons=[tr("取消", "Cancel"), tr("继续", "Continue")],
+                                     cancel_button=0, default_button=0)
+
+            def done(dialog, result):
+                try:
+                    if dialog.choose_finish(result) == 1:
+                        callback()
+                except GLib.Error:
+                    pass
+
+            dialog.choose(self, None, done)
+
+        def on_reinstall(self, *_):
+            self.confirm(tr("用离线安装包覆盖安装 WeGame？登录数据和设置会保留。",
+                            "Unpack WeGame again over the current install? Login data and settings are kept."),
+                         lambda: self.start_task(reinstall))
+
+        def on_rebuild(self, *_):
+            self.confirm(tr("删除整个前缀并重新安装？WeGame 的登录数据会丢失。",
+                            "Delete the whole prefix and install again? WeGame login data will be lost."),
+                         lambda: self.start_task(rebuild))
+
+        def on_download_runner(self, *_):
+            def task(progress):
+                download_dwproton(progress)
+                save_config(runner=None)
+            self.start_task(task)
+
+    def activate(app):
+        if not app.get_active_window():
+            install_style()
+            Window(app)
+        app.get_active_window().present()
+
+    app = Gtk.Application(application_id=APP_ID)
+    app.connect("activate", activate)
+    return app.run([sys.argv[0]])
+
+
+# --------------------------------------------------------------------- CLI
+
+
+def cli_progress():
+    last = [None, False]  # previous message, progress line still open
+
+    def progress(message, fraction=None):
+        if fraction is None:
+            if message != last[0]:
+                if last[1]:
+                    print(file=sys.stderr)  # end the previous progress line
+                print(message, file=sys.stderr)
+            last[1] = False
+        else:
+            print(f"\r\033[K{message}  {fraction * 100:5.1f}%", end="", file=sys.stderr)
+            last[1] = fraction < 1
+            if fraction >= 1:
+                print(file=sys.stderr)
+        last[0] = message
+
+    return progress
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="wegame-launcher",
+        description=tr("在独立的 DW-Proton 前缀里安装和运行 WeGame。不带参数时打开图形界面。",
+                       "Install and run WeGame in its own DW-Proton prefix. Opens the GUI without arguments."),
+    )
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("install", help=tr("下载 WeGame 并配置前缀", "download WeGame and set up the prefix"))
+    run = sub.add_parser("run", help=tr("启动 WeGame（可带 wegame:// 链接）", "launch WeGame (optionally with a wegame:// link)"))
+    run.add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("kill", help=tr("强制结束前缀里的所有进程", "force kill every process in the prefix"))
+    sub.add_parser("reinstall", help=tr("覆盖安装 WeGame，保留登录数据", "unpack WeGame again, keeping login data"))
+    sub.add_parser("rebuild", help=tr("删除整个前缀后重新安装", "delete the whole prefix and install again"))
+    sub.add_parser("status", help=tr("显示安装状态", "show install state"))
+    gs = sub.add_parser("gamescope", help=tr("设置 Gamescope", "configure Gamescope"),
+                        description=tr("不带参数显示当前设置。WeGame 窗口显示异常时可以开启。",
+                                       "Without arguments, show the settings. Turn it on when WeGame's windows misbehave."))
+    gs.add_argument("state", nargs="?", choices=["on", "off"])
+    gs.add_argument("--fullscreen", choices=["on", "off"], help=tr("全屏（默认窗口模式）", "fullscreen (windowed by default)"))
+    gs.add_argument("--res", metavar=tr("宽x高", "WxH"), help=tr("窗口和渲染分辨率，空字符串表示默认", "window and render size; empty for default"))
+    gs.add_argument("--fps", metavar="N", help=tr("限制帧率，空字符串表示不限", "frame limit; empty for none"))
+    gs.add_argument("--fsr", choices=["on", "off"], help=tr("FSR 超分辨率", "FSR upscaling"))
+    gs.add_argument("--args", metavar=tr("参数", "ARGS"), help=tr("追加的 gamescope 参数，写成 --args='--xxx'", "extra gamescope arguments, written as --args='--xxx'"))
+    mangohud = sub.add_parser("mangohud", help=tr("MangoHud 性能叠加层", "MangoHud performance overlay"))
+    mangohud.add_argument("state", nargs="?", choices=["on", "off"])
+    wow64 = sub.add_parser("wow64", help=tr("WoW64 模式（默认开启，无需 32 位库）", "WoW64 mode (on by default; no 32-bit libraries needed)"))
+    wow64.add_argument("state", nargs="?", choices=["on", "off"])
+    runner = sub.add_parser("runner", help=tr("列出或选择 Proton", "list or choose the Proton"),
+                            description=tr("不带参数列出电脑上找到的 Proton；auto 表示自动用最新的 DW-Proton。",
+                                           "Without arguments, list the Protons found; auto picks the newest DW-Proton."))
+    runner.add_argument("choice", nargs="?", metavar=tr("auto|名称|路径", "auto|NAME|PATH"))
+    runner.add_argument("--download", action="store_true", help=tr("下载最新 DW-Proton", "download the latest DW-Proton"))
+    # The .desktop file hands wegame:// links over as a bare argument.
+    argv = sys.argv[1:]
+    if argv and argv[0].lower().startswith("wegame:"):
+        if not is_installed():
+            return run_gui()  # don't start a silent multi-hundred-MB install from a link
+        argv = ["run", *argv]
+    options = parser.parse_args(argv)
+
+    if options.command is None:
+        return run_gui()
+    try:
+        if options.command == "install":
+            install(cli_progress())
+        elif options.command == "run":
+            if not is_installed():
+                install(cli_progress())
+            return run_supervised(options.args, lambda message: print(message, file=sys.stderr))
+        elif options.command == "kill":
+            count = kill_all()
+            print(tr(f"已结束 {count} 个进程", f"Killed {count} processes"))
+        elif options.command == "reinstall":
+            reinstall(cli_progress())
+        elif options.command == "rebuild":
+            rebuild(cli_progress())
+        elif options.command == "gamescope":
+            changes = {}
+            if options.state:
+                changes["enabled"] = options.state == "on"
+            if options.fullscreen:
+                changes["fullscreen"] = options.fullscreen == "on"
+            if options.fsr:
+                changes["fsr"] = options.fsr == "on"
+            for key in ("res", "fps", "args"):
+                value = getattr(options, key)
+                if value is not None:
+                    changes["resolution" if key == "res" else key] = value
+            if changes.get("resolution") and not re.fullmatch(r"\d+x\d+", changes["resolution"]):
+                raise LauncherError(tr(f"分辨率格式应为 宽x高：{changes['resolution']}", f"Resolution must be WxH: {changes['resolution']}"))
+            if changes.get("fps") and not str(changes["fps"]).isdigit():
+                raise LauncherError(tr(f"帧率应为整数：{changes['fps']}", f"Frame limit must be a number: {changes['fps']}"))
+            if changes:
+                set_gamescope(**changes)
+            for key, value in gamescope_settings().items():
+                print(f"{key:<11} {value}")
+            if gamescope_settings()["enabled"]:
+                print("command    ", shlex.join(gamescope_command()))
+        elif options.command == "mangohud":
+            if options.state:
+                save_config(mangohud=options.state == "on")
+            print("mangohud", "on" if load_config().get("mangohud") else "off")
+        elif options.command == "wow64":
+            if options.state:
+                save_config(wow64=options.state == "on")
+            print("wow64", "on" if load_config().get("wow64", True) else "off")
+        elif options.command == "runner":
+            if options.download:
+                download_dwproton(cli_progress())
+                save_config(runner=None)
+            elif options.choice:
+                choose_runner(options.choice)
+            picked = current_runner()
+            for label, path in find_runners().items():
+                print(f"{'*' if path == picked else ' '} {label:<28} {path}")
+            if not load_config().get("runner"):
+                print(tr("（自动：使用最新的 DW-Proton）", "(auto: newest DW-Proton)"))
+        elif options.command == "status":
+            print(f"root:    {ROOT}")
+            proton = current_runner()
+            print(f"runner:  {runner_name()} ({proton or '-'})")
+            print(f"wegame:  {client_version() or '-'}")
+            print(f"running: {', '.join(map(str, prefix_pids())) or '-'}")
+            print(f"logs:    {LOGS}")
+    except LauncherError as exc:
+        print(f"wegame-launcher: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
