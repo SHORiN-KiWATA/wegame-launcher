@@ -1,4 +1,4 @@
-# Maintainer: SHORiN-KiWATA <161345689+SHORiN-KiWATA@users.noreply.github.com>
+# Maintainer: SHORiN-KiWATA <fcl709@outlook.com>
 
 pkgname=wegame-launcher
 pkgver=0.1.0
@@ -9,15 +9,15 @@ url='https://github.com/SHORiN-KiWATA/wegame-launcher'
 license=('GPL-3.0-only')
 depends=('python' 'python-gobject' 'gtk4')
 optdepends=(
-  'gamescope: run WeGame nested in its own compositor'
-  'mangohud: performance overlay'
+    'gamescope: run WeGame nested in its own compositor'
+    'mangohud: performance overlay'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # run updpkgsums once the v$pkgver tag exists
+sha256sums=('SKIP')
 
 package() {
-  cd "$pkgname-$pkgver"
-  install -Dm755 wegame-launcher -t "$pkgdir/usr/bin"
-  install -Dm644 wegame-launcher.desktop -t "$pkgdir/usr/share/applications"
-  install -Dm644 wegame.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/wegame.png"
+    cd "$pkgname-$pkgver"
+    install -Dm755 wegame-launcher -t "$pkgdir/usr/bin"
+    install -Dm644 wegame-launcher.desktop -t "$pkgdir/usr/share/applications"
+    install -Dm644 wegame.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/wegame.png"
 }
