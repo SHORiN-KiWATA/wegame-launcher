@@ -19,5 +19,5 @@ package() {
   cd "$pkgname-$pkgver"
   install -Dm755 wegame-launcher -t "$pkgdir/usr/bin"
   install -Dm644 wegame-launcher.desktop -t "$pkgdir/usr/share/applications"
-  install -Dm644 wegame.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/$pkgname.png"
+  install -Dm644 wegame.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/wegame.png"
 }
