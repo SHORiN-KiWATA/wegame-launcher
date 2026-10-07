@@ -40,6 +40,9 @@ CLIENT = INSTALL_DIR / "wegame.exe"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "wegame-launcher"
 DOWNLOADS = CACHE / "downloads"
 LOGS = CACHE / "logs"
+PROTON_LOG = LOGS / "steam-0.log"  # Proton names its log after SteamGameId
+KEEP_PROTON_LOGS = 3  # earlier sessions kept besides the current one
+LOG_TAIL = 512 * 1024  # how much of a log the viewer loads
 
 STALL_SECONDS = 120
 RETRIES = 5  # connection resets are common on long cross-border downloads
@@ -760,7 +763,8 @@ def launch(args=()):
         raise LauncherError(tr("WeGame 还没有安装", "WeGame is not installed"))
     # A second launch while WeGame runs (e.g. a wegame:// link) must not
     # touch files the running client has open.
-    if not is_running():
+    running = is_running()
+    if not running:
         recover_updates()
     LOGS.mkdir(parents=True, exist_ok=True)
     log = open(LOGS / "wegame.log", "a")
@@ -768,6 +772,7 @@ def launch(args=()):
     log.flush()
     command = [*gamescope_command(), str(require_runner()), "waitforexitandrun", str(CLIENT), *args]
     env = proton_env()
+    proton_log_settings(env, fresh_session=not running)
     if load_config().get("mangohud"):
         if not shutil.which("mangohud"):
             raise LauncherError(tr("已开启 MangoHud，但没有安装 mangohud", "MangoHud is enabled but not installed"))
@@ -775,6 +780,83 @@ def launch(args=()):
     with log:
         return subprocess.Popen(command, env=env, cwd=INSTALL_DIR, stdout=log, stderr=log,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+# -------------------------------------------------------------------- logs
+
+
+def proton_log_settings(env, fresh_session):
+    """Turn on Proton's own log (Wine debug output, DXVK/VKD3D messages) when
+    the user asked for it."""
+    config = load_config()
+    if not config.get("proton_log"):
+        return
+    LOGS.mkdir(parents=True, exist_ok=True)
+    if fresh_session:
+        rotate_proton_log()
+    env["PROTON_LOG"] = "1"
+    env["PROTON_LOG_DIR"] = str(LOGS)
+    if config.get("winedebug"):
+        env["WINEDEBUG"] = config["winedebug"]
+
+
+def rotate_proton_log():
+    """Proton appends to steam-0.log; give each WeGame session its own file
+    and keep only the last few, since a full Wine log can reach gigabytes."""
+    if PROTON_LOG.is_file() and PROTON_LOG.stat().st_size:
+        stamp = datetime.fromtimestamp(PROTON_LOG.stat().st_mtime)
+        PROTON_LOG.rename(LOGS / f"steam-0.{stamp:%Y%m%d-%H%M%S}.log")
+    for old in old_proton_logs()[KEEP_PROTON_LOGS:]:
+        old.unlink(missing_ok=True)
+
+
+def old_proton_logs():
+    return sorted(LOGS.glob("steam-0.*.log"), reverse=True)  # names sort by time
+
+
+def log_files():
+    """(path, title) of every log, the most useful first."""
+    named = [(PROTON_LOG, tr("Proton 日志", "Proton log")),
+             (LOGS / "wegame.log", tr("WeGame 输出", "WeGame output")),
+             (LOGS / "setup.log", tr("安装和初始化", "Install and setup"))]
+    files = [(path, title) for path, title in named if path.is_file()]
+    for path in old_proton_logs():
+        match = re.fullmatch(r"steam-0\.(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)\d\d\.log", path.name)
+        when = f"{match[2]}-{match[3]} {match[4]}:{match[5]}" if match else path.name
+        files.append((path, tr(f"Proton 日志（{when}）", f"Proton log ({when})")))
+    return files
+
+
+def human_size(size):
+    for unit in ("B", "KiB", "MiB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}" if unit == "MiB" else f"{size:.0f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"
+
+
+def read_log_tail(path, limit=LOG_TAIL):
+    """The end of a log as text, and whether earlier lines were left out."""
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        f.seek(max(0, size - limit))
+        data = f.read()
+    truncated = size > limit
+    if truncated:
+        data = data[data.find(b"\n") + 1:]  # drop the partial first line
+    return data.decode("utf-8", errors="replace"), truncated
+
+
+def clear_logs():
+    if is_running():
+        raise LauncherError(tr("WeGame 正在运行，不能清空日志", "WeGame is running; cannot clear the logs"))
+    for path in LOGS.glob("*.log"):
+        path.unlink(missing_ok=True)
+
+
+def open_path(path):
+    subprocess.Popen(["xdg-open", str(path)], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 MAX_RELAUNCHES = 3
@@ -823,8 +905,7 @@ def run_supervised(args=(), notify=lambda message: None):
 
 def open_folder():
     ROOT.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen(["xdg-open", str(ROOT)], start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    open_path(ROOT)
 
 
 # --------------------------------------------------------------------- GUI
@@ -924,6 +1005,17 @@ GUI_CSS = b"""
   color: alpha(@theme_fg_color, 0.55);
   font-size: 0.9em;
 }
+.log-card {
+  background-color: alpha(@theme_fg_color, 0.045);
+  border: 1px solid alpha(@theme_fg_color, 0.08);
+  border-radius: 14px;
+}
+.log-card textview, .log-card textview text {
+  background: transparent;
+}
+.log-text {
+  font-size: 0.85em;
+}
 entry, dropdown > button {
   border-radius: 10px;
 }
@@ -976,7 +1068,7 @@ def run_gui():
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gdk", "4.0")
-    from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
+    from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
 
     def install_style():
         settings = Gtk.Settings.get_default()
@@ -1032,9 +1124,13 @@ def run_gui():
             self.error = None
 
             self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT,
-                                   vhomogeneous=False, interpolate_size=True)
+                                   hhomogeneous=False, vhomogeneous=False, interpolate_size=True)
             self.stack.add_named(self.build_main(), "main")
             self.stack.add_named(self.build_settings(), "settings")
+            self.stack.add_named(self.build_logs(), "logs")
+            self.stack.add_named(self.build_log_view(), "log-view")
+            self.log_timer = None
+            self.size_before_log = None
 
             body = Gtk.Overlay()
             body.set_child(self.stack)
@@ -1086,6 +1182,7 @@ def run_gui():
 
             tools = Gtk.Box(spacing=4, halign=Gtk.Align.CENTER, margin_top=2)
             tools.append(icon_button("folder-open-symbolic", tr("打开前缀目录", "Open prefix folder"), open_folder))
+            tools.append(icon_button("text-x-generic-symbolic", tr("日志", "Logs"), self.show_logs))
             self.settings_button = icon_button("emblem-system-symbolic", tr("设置", "Settings"), self.show_settings)
             tools.append(self.settings_button)
             box.append(tools)
@@ -1225,14 +1322,237 @@ def run_gui():
             self.stack.set_visible_child_name("settings")
 
         def show_main(self):
+            self.leave_log_view()
             self.stack.set_visible_child_name("main")
             self.refresh()
 
         def on_key(self, _controller, keyval, _code, _state):
-            if keyval == Gdk.KEY_Escape and self.stack.get_visible_child_name() == "settings":
+            if keyval != Gdk.KEY_Escape:
+                return False
+            page = self.stack.get_visible_child_name()
+            if page == "log-view":
+                self.show_logs()
+            elif page in ("settings", "logs"):
                 self.show_main()
+            else:
+                return False
+            return True
+
+        # ------------------------------------------------------------ logs
+        def build_logs(self):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, width_request=420,
+                           halign=Gtk.Align.CENTER, vexpand=True,
+                           margin_top=14, margin_bottom=14, margin_start=20, margin_end=20)
+            header = Gtk.Box(spacing=6)
+            header.append(icon_button("go-previous-symbolic", tr("返回", "Back"), self.show_main))
+            header.append(Gtk.Label(label=tr("日志", "Logs"), css_classes=["heading"]))
+            page.append(header)
+
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+            scroller = Gtk.ScrolledWindow(child=content, hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
+            page.append(scroller)
+
+            # Recording
+            self.proton_log_switch = Gtk.Switch()
+            self.proton_log_switch.connect("notify::active", self.on_proton_log_toggled)
+            self.winedebug_entry = Gtk.Entry(placeholder_text=tr("Proton 默认", "Proton default"), hexpand=True)
+            self.winedebug_entry.connect("changed", self.on_winedebug_changed)
+            self.winedebug_row = settings_row(tr("调试通道", "Debug channels"),
+                                              tr("WINEDEBUG，例如 +seh,+loaddll", "WINEDEBUG, e.g. +seh,+loaddll"),
+                                              self.winedebug_entry)
+            content.append(card(tr("记录", "Recording"), [
+                settings_row(tr("Proton 日志", "Proton log"),
+                             tr("下次启动 WeGame 时生效；完整的 Wine 日志可能有几个 GB",
+                                "Takes effect at the next WeGame start; a full Wine log can take gigabytes"),
+                             self.proton_log_switch),
+                self.winedebug_row,
+            ]))
+
+            # Files, filled by load_logs()
+            files = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            files.append(Gtk.Label(label=tr("文件", "Files"), xalign=0, css_classes=["card-title"]))
+            self.log_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-card"])
+            files.append(self.log_list)
+            content.append(files)
+
+            # Manage
+            folder_button = Gtk.Button(label=tr("打开", "Open"), css_classes=["compact-button"])
+            folder_button.connect("clicked", self.on_open_log_folder)
+            clear_button = Gtk.Button(label=tr("清空", "Clear"), css_classes=["compact-button", "compact-danger"])
+            clear_button.connect("clicked", self.on_clear_logs)
+            self.clear_logs_row = settings_row(tr("清空日志", "Clear logs"),
+                                               tr("删除上面列出的所有文件", "Deletes every file listed above"), clear_button)
+            content.append(card(tr("管理", "Manage"), [
+                settings_row(tr("日志文件夹", "Log folder"), str(LOGS).replace(str(HOME), "~", 1), folder_button),
+                self.clear_logs_row,
+            ]))
+            return page
+
+        def load_logs(self):
+            self.loading = True
+            config = load_config()
+            self.proton_log_switch.set_active(bool(config.get("proton_log")))
+            self.winedebug_entry.set_text(config.get("winedebug", ""))
+            self.winedebug_row.set_sensitive(self.proton_log_switch.get_active())
+            self.loading = False
+
+            while child := self.log_list.get_first_child():
+                self.log_list.remove(child)
+            files = []
+            for path, title in log_files():
+                try:
+                    files.append((path, title, path.stat()))
+                except OSError:
+                    pass  # rotated away meanwhile
+            for path, title, stat in files:
+                view = Gtk.Button(label=tr("查看", "View"), css_classes=["compact-button"])
+                view.connect("clicked", lambda _b, p=path, t=title: self.show_log(p, t))
+                when = datetime.fromtimestamp(stat.st_mtime)
+                self.log_list.append(settings_row(title, f"{human_size(stat.st_size)} · {when:%m-%d %H:%M}", view))
+            if not files:
+                self.log_list.append(settings_row(tr("还没有日志", "No logs yet"), None, Gtk.Box()))
+            running = is_running()
+            self.clear_logs_row.set_sensitive(bool(files) and not running)
+            self.clear_logs_row.set_tooltip_text(tr("WeGame 运行时不能清空", "Not while WeGame is running") if running else None)
+
+        def on_proton_log_toggled(self, switch, _):
+            self.winedebug_row.set_sensitive(switch.get_active())
+            if not getattr(self, "loading", False):
+                save_config(proton_log=switch.get_active())
+
+        def on_winedebug_changed(self, entry):
+            if not getattr(self, "loading", False):
+                save_config(winedebug=entry.get_text().strip())
+
+        def on_open_log_folder(self, *_):
+            LOGS.mkdir(parents=True, exist_ok=True)
+            open_path(LOGS)
+
+        def on_clear_logs(self, *_):
+            def clear():
+                try:
+                    clear_logs()
+                except LauncherError:
+                    pass  # WeGame started meanwhile; the row turns insensitive below
+                self.load_logs()
+            self.confirm(tr("删除所有日志文件？", "Delete every log file?"), clear)
+
+        def show_logs(self):
+            self.leave_log_view()
+            self.load_logs()
+            self.stack.set_visible_child_name("logs")
+
+        # -------------------------------------------------------- log view
+        def build_log_view(self):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, width_request=720, height_request=480,
+                           hexpand=True, vexpand=True,
+                           margin_top=14, margin_bottom=14, margin_start=20, margin_end=20)
+            # Leave room on the right for the window's close button.
+            header = Gtk.Box(spacing=6, margin_end=34)
+            header.append(icon_button("go-previous-symbolic", tr("返回", "Back"), self.show_logs))
+            self.log_title = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END, css_classes=["heading"])
+            header.append(self.log_title)
+            header.append(icon_button("edit-copy-symbolic", tr("复制显示的内容", "Copy what is shown"), self.copy_log))
+            header.append(icon_button("document-open-symbolic", tr("用其他程序打开", "Open in another app"),
+                                      lambda: open_path(self.log_path)))
+            page.append(header)
+
+            self.log_filter = Gtk.SearchEntry(placeholder_text=tr("筛选：只显示包含这段文字的行",
+                                                                  "Filter: only lines containing this text"))
+            self.log_filter.connect("search-changed", lambda *_: self.render_log(keep_bottom=True))
+            page.append(self.log_filter)
+
+            self.log_buffer = Gtk.TextBuffer()
+            self.log_view = Gtk.TextView(buffer=self.log_buffer, editable=False, cursor_visible=False, monospace=True,
+                                         wrap_mode=Gtk.WrapMode.NONE, css_classes=["log-text"],
+                                         top_margin=8, bottom_margin=8, left_margin=10, right_margin=10)
+            self.log_scroller = Gtk.ScrolledWindow(child=self.log_view, hexpand=True, vexpand=True,
+                                                   css_classes=["log-card"])
+            self.log_follow = False
+            self.log_scroller.get_vadjustment().connect("changed", self.on_log_layout)
+            page.append(self.log_scroller)
+            self.log_note = Gtk.Label(xalign=0, wrap=True, css_classes=["dim"])
+            page.append(self.log_note)
+            return page
+
+        def show_log(self, path, title):
+            if self.stack.get_visible_child_name() != "log-view":
+                # The viewer is wider than the other pages; shrink back afterwards.
+                self.size_before_log = (self.get_width(), self.get_height())
+            self.log_path = path
+            self.log_stamp = ()  # nothing loaded yet
+            self.log_raw = ""
+            self.log_title.set_text(title)
+            self.log_filter.set_text("")
+            self.stack.set_visible_child_name("log-view")
+            if self.log_timer:
+                GLib.source_remove(self.log_timer)
+            self.poll_log()
+            self.log_timer = GLib.timeout_add_seconds(2, self.poll_log)
+
+        def leave_log_view(self):
+            if self.log_timer:
+                GLib.source_remove(self.log_timer)
+                self.log_timer = None
+            if self.size_before_log and self.stack.get_visible_child_name() == "log-view":
+                # Only after the page transition, while the stack still interpolates its size.
+                size, self.size_before_log = self.size_before_log, None
+                GLib.timeout_add(self.stack.get_transition_duration() + 50,
+                                 lambda: self.set_default_size(*size) or False)
+
+        def poll_log(self):
+            """Reload the log when it changed, following its end like tail -f."""
+            try:
+                stat = self.log_path.stat()
+                stamp = (stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                stamp = None
+            if stamp == self.log_stamp:
                 return True
-            return False
+            first = self.log_stamp == ()
+            follow = first or self.log_at_bottom()
+            self.log_stamp = stamp
+            note = [str(self.log_path).replace(str(HOME), "~", 1)]
+            if stamp is None:
+                self.log_raw = ""
+                note.append(tr("文件不存在", "file is gone"))
+            else:
+                try:
+                    self.log_raw, truncated = read_log_tail(self.log_path)
+                except OSError as exc:
+                    self.log_raw, truncated = "", False
+                    note.append(str(exc))
+                note.append(human_size(stamp[0]))
+                if truncated:
+                    note.append(tr(f"只显示最后 {LOG_TAIL // 1024} KiB", f"showing the last {LOG_TAIL // 1024} KiB"))
+            self.log_note.set_text(" · ".join(note))
+            self.render_log(keep_bottom=follow)
+            return True
+
+        def log_at_bottom(self):
+            adjustment = self.log_scroller.get_vadjustment()
+            return adjustment.get_value() >= adjustment.get_upper() - adjustment.get_page_size() - 24
+
+        def render_log(self, keep_bottom):
+            text = self.log_raw
+            needle = self.log_filter.get_text().lower()
+            if needle:
+                text = "\n".join(line for line in text.splitlines() if needle in line.lower())
+            if not text:
+                text = tr("（没有匹配的行）", "(no matching lines)") if needle else tr("（空）", "(empty)")
+            self.log_follow = keep_bottom
+            self.log_buffer.set_text(text)
+            self.on_log_layout(self.log_scroller.get_vadjustment())
+
+        def on_log_layout(self, adjustment):
+            # Long text is laid out in chunks after set_text(); keep to the end meanwhile.
+            if self.log_follow:
+                adjustment.set_value(adjustment.get_upper() - adjustment.get_page_size())
+
+        def copy_log(self):
+            start, end = self.log_buffer.get_bounds()
+            text = self.log_buffer.get_text(start, end, False)
+            self.get_clipboard().set_content(Gdk.ContentProvider.new_for_value(text))
 
         # ----------------------------------------------------------- state
         def refresh(self):
@@ -1432,6 +1752,12 @@ def main():
     mangohud.add_argument("state", nargs="?", choices=["on", "off"])
     wow64 = sub.add_parser("wow64", help=tr("WoW64 模式（默认开启，无需 32 位库）", "WoW64 mode (on by default; no 32-bit libraries needed)"))
     wow64.add_argument("state", nargs="?", choices=["on", "off"])
+    logs = sub.add_parser("logs", help=tr("列出日志，开关 Proton 日志", "list the logs, turn the Proton log on or off"),
+                          description=tr("不带参数列出日志文件。Proton 日志从下次启动 WeGame 开始记录。",
+                                         "Without arguments, list the log files. The Proton log starts with the next WeGame start."))
+    logs.add_argument("state", nargs="?", choices=["on", "off"], help=tr("Proton 日志", "Proton log"))
+    logs.add_argument("--winedebug", metavar=tr("通道", "CHANNELS"),
+                      help=tr("Proton 日志的 WINEDEBUG，空字符串表示 Proton 默认", "WINEDEBUG for the Proton log; empty for Proton's default"))
     runner = sub.add_parser("runner", help=tr("列出或选择 Proton", "list or choose the Proton"),
                             description=tr("不带参数列出电脑上找到的 Proton；auto 表示自动用最新的 DW-Proton。",
                                            "Without arguments, list the Protons found; auto picks the newest DW-Proton."))
@@ -1491,6 +1817,17 @@ def main():
             if options.state:
                 save_config(wow64=options.state == "on")
             print("wow64", "on" if load_config().get("wow64", True) else "off")
+        elif options.command == "logs":
+            if options.state:
+                save_config(proton_log=options.state == "on")
+            if options.winedebug is not None:
+                save_config(winedebug=options.winedebug.strip())
+            config = load_config()
+            print("proton-log", "on" if config.get("proton_log") else "off")
+            print("winedebug ", config.get("winedebug") or tr("（Proton 默认）", "(Proton default)"))
+            for path, title in log_files():
+                stat = path.stat()
+                print(f"{human_size(stat.st_size):>10}  {datetime.fromtimestamp(stat.st_mtime):%m-%d %H:%M}  {path}  {title}")
         elif options.command == "runner":
             if options.download:
                 download_dwproton(cli_progress())
