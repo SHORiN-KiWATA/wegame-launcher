@@ -590,6 +590,20 @@ def recover_updates():
 # --------------------------------------------------------------- processes
 
 
+def process_environ(entry):
+    """The environment of /proc/<pid>. When the main thread has exited but
+    other threads live on (a zombie leader, common after wineserver dies),
+    the process environ is unreadable; read it through a live thread."""
+    for path in [entry / "environ", *(entry / "task").glob("*/environ")]:
+        try:
+            environ = path.read_bytes()
+        except OSError:
+            continue
+        if environ:
+            return environ.split(b"\0")
+    return []
+
+
 def prefix_pids():
     """PIDs of every process (wineserver included) running in our prefix."""
     markers = {f"STEAM_COMPAT_DATA_PATH={PREFIX}".encode(), f"WINEPREFIX={PFX}".encode()}
@@ -597,11 +611,7 @@ def prefix_pids():
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
             continue
-        try:
-            environ = (entry / "environ").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if markers.intersection(environ):
+        if markers.intersection(process_environ(entry)):
             pids.append(int(entry.name))
     return pids
 
