@@ -21,11 +21,14 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime
@@ -937,7 +940,166 @@ def network_namespace_command():
     if not (pasta := pasta_path()):
         raise LauncherError(tr("已开启独立网络命名空间，但没有安装 passt（pasta）",
                                "The separate network namespace is enabled but passt (pasta) is not installed"))
-    return [pasta, "--config-net", "-f", "--no-pidns", "--"]
+    return [pasta, "--config-net", "-f", "--no-pidns", "--",
+            sys.executable, os.path.realpath(__file__), BUS_BRIDGE_ARG, "--"]
+
+
+# pasta maps the user to root in the session's user namespace. libdbus sends
+# that uid (0) when it authenticates to the session bus, the bus sees the real
+# uid on the socket and refuses the connection, so tray icons, notifications
+# and everything else on D-Bus stopped working inside the namespace. The
+# bridge runs inside the namespace in front of the bus: it lets clients
+# authenticate to it, authenticates to the bus without claiming a uid (the
+# bus then takes the real one from the socket, as sd-bus clients do) and
+# then just copies bytes. File descriptor passing is refused, so the clients
+# fall back to plain messages.
+BUS_BRIDGE_ARG = "--bus-bridge"
+
+
+def bus_address_path(address):
+    """The socket path of a unix:path= D-Bus address, or None."""
+    for entry in (address or "").split(";"):
+        kind, _, params = entry.partition(":")
+        if kind != "unix":
+            continue
+        for param in params.split(","):
+            key, _, value = param.partition("=")
+            if key == "path":
+                return urllib.parse.unquote(value)
+    return None
+
+
+class BusAuthError(Exception):
+    pass
+
+
+def bus_read_line(sock, buffer):
+    """Read one \\r\\n-terminated line of the authentication protocol; buffer
+    keeps what was received beyond it."""
+    while b"\r\n" not in buffer:
+        data = sock.recv(4096)
+        if not data:
+            raise BusAuthError("connection closed")
+        buffer += data
+        if len(buffer) > 16384:
+            raise BusAuthError("line too long")
+    line, _, rest = bytes(buffer).partition(b"\r\n")
+    buffer[:] = rest
+    return line.decode("ascii", "replace")
+
+
+def bus_connect_upstream(path):
+    """Connect to the real bus and authenticate as whoever the socket says we are."""
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    upstream.connect(path)
+    upstream.sendall(b"\0AUTH EXTERNAL\r\n")
+    buffer = bytearray()
+    reply = bus_read_line(upstream, buffer)
+    if reply.startswith("DATA"):
+        upstream.sendall(b"DATA\r\n")
+        reply = bus_read_line(upstream, buffer)
+    if not reply.startswith("OK "):
+        upstream.close()
+        raise BusAuthError(f"the bus refused us: {reply}")
+    return upstream, reply
+
+
+def bus_copy(src, dst):
+    try:
+        while data := src.recv(65536):
+            dst.sendall(data)
+    except OSError:
+        pass
+    for sock, how in ((dst, socket.SHUT_WR), (src, socket.SHUT_RD)):
+        try:
+            sock.shutdown(how)
+        except OSError:
+            pass
+
+
+def bus_serve_client(client, path):
+    upstream = None
+    try:
+        buffer = bytearray()
+        while not buffer:
+            if not (data := client.recv(4096)):
+                return
+            buffer += data
+        if buffer[0] != 0:
+            return
+        del buffer[0]
+        ok = None
+        while True:
+            line = bus_read_line(client, buffer)
+            command, _, arg = line.partition(" ")
+            if command == "AUTH" and arg.startswith("EXTERNAL"):
+                if arg == "EXTERNAL":  # no initial response: ask for it
+                    client.sendall(b"DATA\r\n")
+                    continue
+            elif command == "DATA":
+                pass
+            elif command == "NEGOTIATE_UNIX_FD":
+                client.sendall(b"ERROR\r\n")
+                continue
+            elif command == "BEGIN" and ok:
+                upstream.sendall(b"BEGIN\r\n" + bytes(buffer))
+                break
+            elif command in ("AUTH", "CANCEL"):
+                client.sendall(b"REJECTED EXTERNAL\r\n")
+                continue
+            else:
+                client.sendall(b"ERROR\r\n")
+                continue
+            # The client has identified itself; anyone who can reach the
+            # socket is the user, so accept and authenticate upstream.
+            if not ok:
+                upstream, ok = bus_connect_upstream(path)
+            client.sendall(ok.encode() + b"\r\n")
+        threading.Thread(target=bus_copy, args=(upstream, client), daemon=True).start()
+        bus_copy(client, upstream)
+    except (OSError, BusAuthError):
+        pass
+    finally:
+        client.close()
+        if upstream:
+            upstream.close()
+
+
+def bus_bridge(command):
+    """Run command with DBUS_SESSION_BUS_ADDRESS pointing at a bridge to the
+    session bus, and return its exit status."""
+    env = dict(os.environ)
+    path = bus_address_path(env.get("DBUS_SESSION_BUS_ADDRESS"))
+    server = None
+    if path:
+        runtime_dir = Path(env.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()) / "wegame-launcher"
+        runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        bridge = runtime_dir / f"bus-{os.getpid()}"
+        bridge.unlink(missing_ok=True)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(bridge))
+        server.listen(64)
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bridge}"
+
+        def accept():
+            while True:
+                try:
+                    client, _ = server.accept()
+                except OSError:
+                    return
+                threading.Thread(target=bus_serve_client, args=(client, path), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+    child = subprocess.Popen(command, env=env)
+    # pass on what would end the session, e.g. from "wegame-launcher kill"
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _: child.send_signal(signum))
+    try:
+        return child.wait()
+    finally:
+        if server:
+            server.close()
+            bridge.unlink(missing_ok=True)
 
 
 def launch(args=()):
@@ -1951,6 +2113,11 @@ def cli_progress():
 
 
 def main():
+    if sys.argv[1:2] == [BUS_BRIDGE_ARG]:  # inside the session's network namespace
+        command = sys.argv[2:]
+        if command[:1] == ["--"]:
+            command = command[1:]
+        sys.exit(bus_bridge(command))
     parser = argparse.ArgumentParser(
         prog="wegame-launcher",
         description=tr("用 WE-Proton 在独立的前缀里安装和运行 WeGame。不带参数时打开图形界面。",
