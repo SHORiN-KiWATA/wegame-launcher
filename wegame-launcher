@@ -5,9 +5,10 @@
 Uses WE-Proton (https://github.com/SHORiN-KiWATA/we-proton), a Proton fork that
 fixes WeGame's problems under Wine: the newest one found on the machine, or a
 download of the latest release when there is none. Any other Proton can still
-be picked by hand. Everything lives in
-~/.wegame-launcher (runner, tools, prefix, update backups); downloads and logs
-go to ~/.cache/wegame-launcher. Without arguments a GTK window opens; see
+be picked by hand. Proton runs inside the Steam Linux Runtime it asks for, a copy
+from umu or Steam or one downloaded from Valve. Everything lives in
+~/.wegame-launcher (runner, runtime, tools, prefix, update backups); downloads
+and logs go to ~/.cache/wegame-launcher. Without arguments a GTK window opens; see
 `wegame-launcher --help` for the command line.
 """
 
@@ -51,9 +52,26 @@ RETRIES = 5  # connection resets are common on long cross-border downloads
 USER_AGENT = "wegame-launcher"
 
 RUNNER_DIR = ROOT / "runner"  # WE-Proton downloaded by us
+RUNTIME_DIR = ROOT / "runtime"  # Steam Linux Runtime downloaded by us
 TOOLS_DIR = ROOT / "tools"
 CONFIG = ROOT / "config.json"
 WE_RELEASE_API = "https://api.github.com/repos/SHORiN-KiWATA/we-proton/releases/latest"
+# The first WE-Proton whose Unix libraries load inside the Steam Linux Runtime;
+# earlier builds were linked against host libraries the runtime does not have.
+MIN_WEPROTON = "we-proton-11.0-14-10"
+
+# Proton is built for a Steam Linux Runtime container and names it in
+# toolmanifest.vdf ("require_tool_appid"). Its bundled libraries, e.g. the
+# GStreamer plugins Wine decodes WMA/WMV and H.264 with, only find their
+# dependencies inside it. For each runtime: the directory Steam installs it
+# to, the one umu uses, and Valve's download.
+RUNTIMES = {
+    "4183110": ("SteamLinuxRuntime_4", "steamrt4",
+                "https://repo.steampowered.com/steamrt4/images/latest-public-stable/", "SteamLinuxRuntime_4.tar.xz"),
+    "1628350": ("SteamLinuxRuntime_sniper", "steamrt3",
+                "https://repo.steampowered.com/steamrt-images-sniper/snapshots/latest-container-runtime-public-beta/",
+                "SteamLinuxRuntime_sniper.tar.xz"),
+}
 
 # Official static 7-Zip, used only when the system has no 7z.
 SEVENZIP_URL = "https://www.7-zip.org/a/7z2603-linux-x64.tar.xz"
@@ -355,8 +373,136 @@ def download_weproton(progress=_quiet):
     return RUNNER_DIR / tag / "proton"
 
 
+def old_weproton(proton):
+    """A WE-Proton from before MIN_WEPROTON, which cannot run in the runtime."""
+    label = runner_label(proton)
+    return is_weproton(label) and version_key(label) < version_key(MIN_WEPROTON)
+
+
+def runner_outdated(proton):
+    """A WE-Proton picked automatically that predates MIN_WEPROTON."""
+    if load_config().get("runner") or os.environ.get("WEGAME_LAUNCHER_PROTON"):
+        return False  # the user's choice
+    return old_weproton(proton)
+
+
 def ensure_runner(progress=_quiet):
-    return current_runner() or download_weproton(progress)
+    proton = current_runner()
+    if proton is None or runner_outdated(proton):
+        proton = download_weproton(progress)
+    return proton
+
+
+# ----------------------------------------------------------------- runtime
+
+
+def required_runtime(proton: Path):
+    """The Steam Linux Runtime app id the Proton asks for, or None."""
+    try:
+        manifest = (proton.parent / "toolmanifest.vdf").read_text(errors="replace")
+    except OSError:
+        return None
+    match = re.search(r'"require_tool_appid"\s+"(\d+)"', manifest)
+    return match.group(1) if match else None
+
+
+def runtime_enabled():
+    return load_config().get("steam_runtime", True)
+
+
+def find_runtime(appid):
+    """An installed copy of the runtime: ours, umu's or Steam's."""
+    if appid not in RUNTIMES:
+        return None
+    steam_name, umu_name, _, _ = RUNTIMES[appid]
+    candidates = [RUNTIME_DIR / umu_name, HOME / ".local/share/umu" / umu_name]
+    candidates += [root / "steamapps/common" / steam_name for root in steam_roots()]
+    for path in candidates:
+        if (path / "_v2-entry-point").is_file():
+            return path
+    return None
+
+
+def download_runtime(appid, progress=_quiet):
+    """Download the runtime from Valve into ~/.wegame-launcher/runtime."""
+    steam_name, umu_name, base, archive = RUNTIMES[appid]
+    progress(tr("正在获取 Steam 运行时信息…", "Looking up the Steam Linux Runtime…"), None)
+    try:
+        sums = http_get(base + "SHA256SUMS").decode()
+    except OSError as exc:
+        raise LauncherError(tr(f"无法获取 Steam 运行时校验值：{exc}", f"Cannot fetch the Steam Linux Runtime checksums: {exc}"))
+    expected = next((line.split()[0] for line in sums.splitlines()
+                     if line.split() and line.split()[-1].lstrip("*") == archive), None)
+    if not expected:
+        raise LauncherError(tr(f"校验文件里没有 {archive}", f"No checksum for {archive}"))
+
+    tarball = download(base + archive, DOWNLOADS / archive, tr("下载 Steam 运行时", "Downloading the Steam Linux Runtime"), progress)
+    if file_digest(tarball, "sha256", tr("校验 Steam 运行时…", "Verifying the Steam Linux Runtime…"), progress) != expected:
+        tarball.unlink()
+        raise LauncherError(tr("Steam 运行时校验失败，已删除，请重试", "Steam Linux Runtime checksum mismatch; removed, please retry"))
+
+    staging = RUNTIME_DIR / f".{umu_name}.tmp"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    size = tarball.stat().st_size
+    with open(tarball, "rb") as raw, tarfile.open(fileobj=raw, mode="r|xz") as tar:
+        for member in tar:
+            tar.extract(member, staging, filter="tar")
+            progress(tr("解压 Steam 运行时…", "Extracting the Steam Linux Runtime…"), raw.tell() / size)
+    if not (staging / steam_name / "_v2-entry-point").is_file():
+        raise LauncherError(tr("Steam 运行时压缩包内容不对", "Unexpected Steam Linux Runtime archive contents"))
+    shutil.rmtree(RUNTIME_DIR / umu_name, ignore_errors=True)
+    (staging / steam_name).rename(RUNTIME_DIR / umu_name)
+    shutil.rmtree(staging)
+    tarball.unlink()
+    return RUNTIME_DIR / umu_name
+
+
+def runtime_wanted(proton):
+    """The runtime app id to run this Proton in, or None to run it directly:
+    the runtime is turned off, the Proton asks for none we know, or it is an
+    old WE-Proton that only works outside the runtime."""
+    appid = required_runtime(proton)
+    if not runtime_enabled() or appid not in RUNTIMES or old_weproton(proton):
+        return None
+    return appid
+
+
+def runtime_for(proton, download=False, progress=_quiet):
+    """The runtime to run this Proton in, or None to run it directly."""
+    appid = runtime_wanted(proton)
+    if appid is None:
+        return None
+    runtime = find_runtime(appid)
+    if runtime is None:
+        if not download:
+            raise LauncherError(tr("还没有下载 Steam 运行时", "The Steam Linux Runtime is not downloaded yet"))
+        runtime = download_runtime(appid, progress)
+    return runtime
+
+
+def ready_to_run():
+    """Whether WeGame can start without downloading anything first."""
+    proton = current_runner()
+    if proton is None or runner_outdated(proton):
+        return False
+    appid = runtime_wanted(proton)
+    return appid is None or find_runtime(appid) is not None
+
+
+def ensure_ready(progress=_quiet):
+    """Download whatever running WeGame needs: WE-Proton and its runtime."""
+    runtime_for(ensure_runner(progress), download=True, progress=progress)
+
+
+def proton_command(verb, *args):
+    """proton <verb> <args>, inside the Steam Linux Runtime when it applies."""
+    proton = require_runner()
+    command = [str(proton), verb, *args]
+    runtime = runtime_for(proton)
+    if runtime:
+        command = [str(runtime / "_v2-entry-point"), f"--verb={verb}", "--", *command]
+    return command
 
 
 def choose_runner(choice):
@@ -419,12 +565,12 @@ def proton_env():
 
 
 def proton_run(*args, log_name="setup.log"):
-    proton = require_runner()
+    command = proton_command(*args)
     LOGS.mkdir(parents=True, exist_ok=True)
     with open(LOGS / log_name, "a") as log:
-        log.write(f"\n--- {datetime.now():%F %T} proton {' '.join(args)}\n")
+        log.write(f"\n--- {datetime.now():%F %T} {shlex.join(command)}\n")
         log.flush()
-        status = subprocess.call([str(proton), *args], env=proton_env(), stdout=log, stderr=log)
+        status = subprocess.call(command, env=proton_env(), stdout=log, stderr=log)
     if status != 0:
         raise LauncherError(tr(f"proton {args[0]} 失败（{status}），见 {LOGS / log_name}",
                                f"proton {args[0]} failed ({status}), see {LOGS / log_name}"))
@@ -683,8 +829,8 @@ class InstallLock:
 
 
 def _install(progress, force_client=False):
-    """Runner, prefix, client and registry; finished steps are skipped."""
-    ensure_runner(progress)
+    """Runner, runtime, prefix, client and registry; finished steps are skipped."""
+    ensure_ready(progress)
     if not (PFX / "drive_c").is_dir():
         progress(tr("初始化前缀（首次需要几分钟）…", "Creating the prefix (takes a few minutes)…"), None)
         proton_run("run", "wineboot", "-u")
@@ -776,9 +922,9 @@ def launch(args=()):
         recover_updates()
     LOGS.mkdir(parents=True, exist_ok=True)
     log = open(LOGS / "wegame.log", "a")
-    log.write(f"\n--- {datetime.now():%F %T} launch\n")
+    command = [*gamescope_command(), *proton_command("waitforexitandrun", str(CLIENT), *args)]
+    log.write(f"\n--- {datetime.now():%F %T} launch: {shlex.join(command)}\n")
     log.flush()
-    command = [*gamescope_command(), str(require_runner()), "waitforexitandrun", str(CLIENT), *args]
     env = proton_env()
     proton_log_settings(env, fresh_session=not running)
     if load_config().get("mangohud"):
@@ -1217,8 +1363,13 @@ def run_gui():
             download.connect("clicked", self.on_download_runner)
             self.wow64_switch = Gtk.Switch()
             self.wow64_switch.connect("notify::active", lambda s, _: save_config(wow64=s.get_active()))
+            self.runtime_switch = Gtk.Switch()
+            self.runtime_switch.connect("notify::active", lambda s, _: save_config(steam_runtime=s.get_active()))
             content.append(card("Proton", [
                 settings_row(tr("运行器", "Runner"), None, self.runner_dropdown),
+                settings_row(tr("Steam 运行时", "Steam Linux Runtime"),
+                             tr("在 Proton 要求的容器里运行；关掉后视频、音频解码等会缺库", "Run in the container Proton is built for; without it e.g. media decoding lacks libraries"),
+                             self.runtime_switch),
                 settings_row(tr("WoW64 模式", "WoW64 mode"), tr("不需要 32 位系统库", "No 32-bit system libraries needed"), self.wow64_switch),
                 settings_row("WE-Proton", tr("下载最新版本", "Get the latest release"), download),
             ]))
@@ -1275,6 +1426,7 @@ def run_gui():
 
             config = load_config()
             self.wow64_switch.set_active(config.get("wow64", True))
+            self.runtime_switch.set_active(config.get("steam_runtime", True))
             has_mangohud = shutil.which("mangohud") is not None
             self.mangohud_switch.set_active(bool(config.get("mangohud")) and has_mangohud)
             self.mangohud_row.set_sensitive(has_mangohud)
@@ -1586,12 +1738,14 @@ def run_gui():
                     self.set_status(tr(f"将使用 {runner_name()}，并下载 WeGame 官方离线安装包",
                                        f"Uses {runner_name()} and downloads the official WeGame offline package"))
                 else:
-                    self.set_status(tr("将下载 WE-Proton 和 WeGame 官方离线安装包",
-                                       "Downloads WE-Proton and the official WeGame offline package"))
+                    self.set_status(tr("将下载 WE-Proton、Steam 运行时和 WeGame 官方离线安装包",
+                                       "Downloads WE-Proton, the Steam Linux Runtime and the official WeGame offline package"))
             elif running:
                 self.set_status(tr("WeGame 运行中", "WeGame is running"))
-            elif not current_runner():
+            elif not current_runner() or runner_outdated(current_runner()):
                 self.set_status(tr("启动时会先下载 WE-Proton", "WE-Proton will be downloaded on start"))
+            elif not ready_to_run():
+                self.set_status(tr("启动时会先下载 Steam 运行时", "The Steam Linux Runtime will be downloaded on start"))
             else:
                 extras = [name for name, on in (("Gamescope", gamescope_settings()["enabled"]),
                                                 ("MangoHud", load_config().get("mangohud"))) if on]
@@ -1655,13 +1809,14 @@ def run_gui():
 
         # --------------------------------------------------------- actions
         def on_launch(self, *_, fetched=False):
-            if current_runner() is None:
-                if fetched:  # e.g. WEGAME_LAUNCHER_PROTON points nowhere
-                    self.launch_failed(tr("没有可用的 Proton", "No usable Proton"))
-                    return
-                # The Proton WeGame was installed with is gone, or it was installed
-                # before the switch to WE-Proton: fetch WE-Proton, then start.
-                self.start_task(ensure_runner, then=lambda: self.on_launch(fetched=True))
+            if not fetched and not ready_to_run():
+                # The Proton WeGame was installed with is gone or too old to run in
+                # the Steam Linux Runtime, or the runtime is not there yet: fetch
+                # what is missing, then start.
+                self.start_task(ensure_ready, then=lambda: self.on_launch(fetched=True))
+                return
+            if current_runner() is None:  # e.g. WEGAME_LAUNCHER_PROTON points nowhere
+                self.launch_failed(tr("没有可用的 Proton", "No usable Proton"))
                 return
             self.error = None
             self.launch_button.set_sensitive(False)
@@ -1729,7 +1884,7 @@ def run_gui():
 
 
 def cli_progress():
-    last = [None, False]  # previous message, progress line still open
+    last = [None, False, None]  # previous message, progress line still open, its text
 
     def progress(message, fraction=None):
         if fraction is None:
@@ -1739,7 +1894,11 @@ def cli_progress():
                 print(message, file=sys.stderr)
             last[1] = False
         else:
-            print(f"\r\033[K{message}  {fraction * 100:5.1f}%", end="", file=sys.stderr)
+            # Tar reports per file; only redraw when the line would change.
+            line = f"{message}  {fraction * 100:5.1f}%"
+            if line != last[2]:
+                print(f"\r\033[K{line}", end="", file=sys.stderr)
+                last[2] = line
             last[1] = fraction < 1
             if fraction >= 1:
                 print(file=sys.stderr)
@@ -1775,6 +1934,10 @@ def main():
     mangohud.add_argument("state", nargs="?", choices=["on", "off"])
     wow64 = sub.add_parser("wow64", help=tr("WoW64 模式（默认开启，无需 32 位库）", "WoW64 mode (on by default; no 32-bit libraries needed)"))
     wow64.add_argument("state", nargs="?", choices=["on", "off"])
+    runtime = sub.add_parser("runtime", help=tr("Steam 运行时（默认开启）", "Steam Linux Runtime (on by default)"))
+    runtime.add_argument("state", nargs="?", choices=["on", "off"])
+    runtime.add_argument("--download", action="store_true",
+                         help=tr("下载或更新当前 Proton 需要的运行时", "download or update the runtime the current Proton needs"))
     logs = sub.add_parser("logs", help=tr("列出日志，开关 Proton 日志", "list the logs, turn the Proton log on or off"),
                           description=tr("不带参数列出日志文件。Proton 日志从下次启动 WeGame 开始记录。",
                                          "Without arguments, list the log files. The Proton log starts with the next WeGame start."))
@@ -1800,7 +1963,7 @@ def main():
         if options.command == "install":
             install(cli_progress())
         elif options.command == "run":
-            if not is_installed() or current_runner() is None:
+            if not is_installed() or not ready_to_run():
                 install(cli_progress())
             return run_supervised(options.args, lambda message: print(message, file=sys.stderr))
         elif options.command == "kill":
@@ -1862,10 +2025,24 @@ def main():
                 print(f"{'*' if path == picked else ' '} {label:<28} {path}")
             if not load_config().get("runner"):
                 print(tr("（自动：使用最新的 WE-Proton）", "(auto: newest WE-Proton)"))
+        elif options.command == "runtime":
+            if options.state:
+                save_config(steam_runtime=options.state == "on")
+            proton = current_runner()
+            appid = required_runtime(proton) if proton else None
+            if options.download:
+                if appid not in RUNTIMES:
+                    raise LauncherError(tr("当前 Proton 不需要已知的 Steam 运行时", "The current Proton needs no known Steam Linux Runtime"))
+                download_runtime(appid, cli_progress())
+            print("steam-runtime", "on" if runtime_enabled() else "off")
+            print(f"required:      {RUNTIMES[appid][0] if appid in RUNTIMES else (appid or '-')}")
+            print(f"installed:     {(find_runtime(appid) if appid in RUNTIMES else None) or '-'}")
         elif options.command == "status":
             print(f"root:    {ROOT}")
             proton = current_runner()
             print(f"runner:  {runner_name()} ({proton or '-'})")
+            appid = runtime_wanted(proton) if proton else None
+            print(f"runtime: {(find_runtime(appid) or '-') if appid else tr('不使用', 'not used')}")
             print(f"wegame:  {client_version() or '-'}")
             print(f"running: {', '.join(map(str, prefix_pids())) or '-'}")
             print(f"logs:    {LOGS}")

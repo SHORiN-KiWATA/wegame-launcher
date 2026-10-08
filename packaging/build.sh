@@ -41,8 +41,8 @@ Homepage: https://github.com/SHORiN-KiWATA/wegame-launcher
 Description: Install and run Tencent WeGame with Proton
  A small GTK launcher that installs the official WeGame offline package into
  its own Wine prefix and runs it with WE-Proton, a Proton fork that fixes
- WeGame's problems under Wine. WE-Proton is downloaded automatically when it
- is not installed. Open "WeGame 启动器" from the application menu.
+ WeGame's problems under Wine. WE-Proton and the Steam Linux Runtime it runs
+ in are downloaded automatically when they are not installed. Open "WeGame 启动器" from the application menu.
 CTRL
     dpkg-deb --root-owner-group --build "$stage" "$dist/${pkg}_${version}-1_all.deb"
     rm -rf "$stage"
