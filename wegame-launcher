@@ -608,14 +608,20 @@ def process_environ(entry):
 
 
 def prefix_pids():
-    """PIDs of every process (wineserver included) running in our prefix."""
-    markers = {f"STEAM_COMPAT_DATA_PATH={PREFIX}".encode(), f"WINEPREFIX={PFX}".encode()}
+    """PIDs of every process (wineserver included) running in our prefix.
+    Processes Wine starts itself (winedevice.exe and the like) carry only
+    WINEPREFIX, which Proton sets with a trailing slash, so compare paths
+    rather than raw strings."""
+    markers = {(b"STEAM_COMPAT_DATA_PATH", PREFIX), (b"WINEPREFIX", PFX)}
     pids = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
             continue
-        if markers.intersection(process_environ(entry)):
-            pids.append(int(entry.name))
+        for var in process_environ(entry):
+            name, _, value = var.partition(b"=")
+            if value and (name, Path(os.fsdecode(value))) in markers:
+                pids.append(int(entry.name))
+                break
     return pids
 
 
