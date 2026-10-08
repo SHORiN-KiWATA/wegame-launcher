@@ -29,6 +29,7 @@ pkgbase = wegame-launcher
 	optdepends = 7zip: 解压 WeGame 离线安装包（没有时自动下载）
 	optdepends = gamescope: run WeGame nested in its own compositor
 	optdepends = mangohud: performance overlay
+	optdepends = passt: 独立网络命名空间，TUN 模式的加速器需要
 	source = wegame-launcher-0.2.0.tar.gz::https://github.com/SHORiN-KiWATA/wegame-launcher/archive/refs/tags/v0.2.0.tar.gz
 	sha256sums = 7c38126214df3bd21353bd57175c04c6bb2ca1a884d16f1b7f04a050a326e2bf
 

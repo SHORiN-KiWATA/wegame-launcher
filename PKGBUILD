@@ -19,7 +19,8 @@ optdepends=('vulkan-driver: 显卡的 Vulkan 驱动（DXVK 渲染需要）'
             'xdg-utils: 在文件管理器里打开文件夹'
             '7zip: 解压 WeGame 离线安装包（没有时自动下载）'
             'gamescope: run WeGame nested in its own compositor'
-            'mangohud: performance overlay')
+            'mangohud: performance overlay'
+            'passt: 独立网络命名空间，TUN 模式的加速器需要')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('7c38126214df3bd21353bd57175c04c6bb2ca1a884d16f1b7f04a050a326e2bf')
 

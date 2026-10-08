@@ -561,6 +561,12 @@ def proton_env():
     # crashes outright when e.g. 32-bit libgcc_s is missing.
     if load_config().get("wow64", True):
         env.setdefault("PROTON_USE_WOW64", "1")
+    if network_namespace_enabled():
+        # The namespace gives the session CAP_NET_ADMIN in its own user
+        # namespace, so WE-Proton's builtin wintun can create a TUN adapter;
+        # the vendor wintun would try to install a Windows driver instead.
+        overrides = [o for o in (env.get("WINEDLLOVERRIDES"), "wintun=b") if o]
+        env["WINEDLLOVERRIDES"] = ";".join(overrides)
     return env
 
 
@@ -911,6 +917,29 @@ def gamescope_command():
     return command + ["--"]
 
 
+def network_namespace_enabled():
+    return bool(load_config().get("network_namespace"))
+
+
+def pasta_path():
+    """pasta from the passt package, or None when it is not installed."""
+    return shutil.which("pasta")
+
+
+def network_namespace_command():
+    """pasta [options] -- prefix when the session should run in its own
+    network namespace, or [] when disabled. The session then gets its own user
+    and network namespace, so programs that create virtual adapters (game
+    accelerators, VPNs) work without root, and nothing outside the session is
+    affected."""
+    if not network_namespace_enabled():
+        return []
+    if not (pasta := pasta_path()):
+        raise LauncherError(tr("已开启独立网络命名空间，但没有安装 passt（pasta）",
+                               "The separate network namespace is enabled but passt (pasta) is not installed"))
+    return [pasta, "--config-net", "-f", "--no-pidns", "--"]
+
+
 def launch(args=()):
     """Start WeGame detached and return its Popen."""
     if not is_installed():
@@ -922,7 +951,8 @@ def launch(args=()):
         recover_updates()
     LOGS.mkdir(parents=True, exist_ok=True)
     log = open(LOGS / "wegame.log", "a")
-    command = [*gamescope_command(), *proton_command("waitforexitandrun", str(CLIENT), *args)]
+    command = [*network_namespace_command(), *gamescope_command(),
+               *proton_command("waitforexitandrun", str(CLIENT), *args)]
     log.write(f"\n--- {datetime.now():%F %T} launch: {shlex.join(command)}\n")
     log.flush()
     env = proton_env()
@@ -1365,11 +1395,19 @@ def run_gui():
             self.wow64_switch.connect("notify::active", lambda s, _: save_config(wow64=s.get_active()))
             self.runtime_switch = Gtk.Switch()
             self.runtime_switch.connect("notify::active", lambda s, _: save_config(steam_runtime=s.get_active()))
+            self.netns_switch = Gtk.Switch()
+            self.netns_switch.connect("notify::active", lambda s, _: save_config(network_namespace=s.get_active()))
+            self.netns_row = settings_row(
+                tr("独立网络命名空间", "Separate network namespace"),
+                tr("让加速器、VPN 能建虚拟网卡（需要 passt）",
+                   "Lets accelerators and VPNs create a virtual adapter (needs passt)"),
+                self.netns_switch)
             content.append(card("Proton", [
                 settings_row(tr("运行器", "Runner"), None, self.runner_dropdown),
                 settings_row(tr("Steam 运行时", "Steam Linux Runtime"),
                              tr("在 Proton 要求的容器里运行；关掉后视频、音频解码等会缺库", "Run in the container Proton is built for; without it e.g. media decoding lacks libraries"),
                              self.runtime_switch),
+                self.netns_row,
                 settings_row(tr("WoW64 模式", "WoW64 mode"), tr("不需要 32 位系统库", "No 32-bit system libraries needed"), self.wow64_switch),
                 settings_row("WE-Proton", tr("下载最新版本", "Get the latest release"), download),
             ]))
@@ -1427,6 +1465,10 @@ def run_gui():
             config = load_config()
             self.wow64_switch.set_active(config.get("wow64", True))
             self.runtime_switch.set_active(config.get("steam_runtime", True))
+            has_pasta = pasta_path() is not None
+            self.netns_switch.set_active(bool(config.get("network_namespace")) and has_pasta)
+            self.netns_row.set_sensitive(has_pasta)
+            self.netns_row.set_tooltip_text(None if has_pasta else tr("没有安装 passt", "passt is not installed"))
             has_mangohud = shutil.which("mangohud") is not None
             self.mangohud_switch.set_active(bool(config.get("mangohud")) and has_mangohud)
             self.mangohud_row.set_sensitive(has_mangohud)
@@ -1934,6 +1976,11 @@ def main():
     mangohud.add_argument("state", nargs="?", choices=["on", "off"])
     wow64 = sub.add_parser("wow64", help=tr("WoW64 模式（默认开启，无需 32 位库）", "WoW64 mode (on by default; no 32-bit libraries needed)"))
     wow64.add_argument("state", nargs="?", choices=["on", "off"])
+    netns = sub.add_parser("netns", help=tr("独立网络命名空间（默认关闭，需要 passt）",
+                                            "Separate network namespace (off by default; needs passt)"),
+                           description=tr("会话在自己的网络命名空间里运行，加速器、VPN 这类要建虚拟网卡的程序不需要 root。",
+                                          "The session runs in its own network namespace, so accelerators and VPNs that create a virtual adapter need no root."))
+    netns.add_argument("state", nargs="?", choices=["on", "off"])
     runtime = sub.add_parser("runtime", help=tr("Steam 运行时（默认开启）", "Steam Linux Runtime (on by default)"))
     runtime.add_argument("state", nargs="?", choices=["on", "off"])
     runtime.add_argument("--download", action="store_true",
@@ -2003,6 +2050,13 @@ def main():
             if options.state:
                 save_config(wow64=options.state == "on")
             print("wow64", "on" if load_config().get("wow64", True) else "off")
+        elif options.command == "netns":
+            if options.state:
+                if options.state == "on" and not pasta_path():
+                    raise LauncherError(tr("没有安装 passt（pasta）", "passt (pasta) is not installed"))
+                save_config(network_namespace=options.state == "on")
+            print("network-namespace", "on" if network_namespace_enabled() else "off")
+            print("pasta", pasta_path() or tr("未安装", "not installed"))
         elif options.command == "logs":
             if options.state:
                 save_config(proton_log=options.state == "on")
@@ -2043,6 +2097,7 @@ def main():
             print(f"runner:  {runner_name()} ({proton or '-'})")
             appid = runtime_wanted(proton) if proton else None
             print(f"runtime: {(find_runtime(appid) or '-') if appid else tr('不使用', 'not used')}")
+            print(f"netns:   {'on' if network_namespace_enabled() else 'off'}")
             print(f"wegame:  {client_version() or '-'}")
             print(f"running: {', '.join(map(str, prefix_pids())) or '-'}")
             print(f"logs:    {LOGS}")
