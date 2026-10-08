@@ -940,8 +940,35 @@ def network_namespace_command():
     if not (pasta := pasta_path()):
         raise LauncherError(tr("已开启独立网络命名空间，但没有安装 passt（pasta）",
                                "The separate network namespace is enabled but passt (pasta) is not installed"))
-    return [pasta, "--config-net", "-f", "--no-pidns", "--",
+    return [pasta, "--config-net", "--ns-mac-addr", namespace_mac_address(), "-f", "--no-pidns", "--",
             sys.executable, os.path.realpath(__file__), BUS_BRIDGE_ARG, "--"]
+
+
+def namespace_mac_address():
+    """MAC address for the adapter inside the namespace. pasta makes up a new
+    one on every start, which to anti-cheat looks like a machine-ID changer;
+    use the one of the host adapter the default route goes through instead, so
+    programs see the same adapter with or without the namespace."""
+    best = None
+    try:
+        for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+            iface, dest, _, flags, _, _, metric, *_ = line.split()
+            if dest == "00000000" and int(flags, 16) & 1 and (best is None or int(metric) < best[0]):
+                best = (int(metric), iface)
+        if best:
+            mac = (Path("/sys/class/net") / best[1] / "address").read_text().strip()
+            if re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac) and mac != "00:00:00:00:00:00":
+                return mac
+    except (OSError, ValueError):
+        pass
+    # no default route: still the same address every time, locally administered
+    try:
+        seed = Path("/etc/machine-id").read_bytes()
+    except OSError:
+        seed = str(HOME).encode()
+    octets = bytearray(hashlib.sha256(b"wegame-launcher netns " + seed).digest()[:6])
+    octets[0] = (octets[0] & 0xfc) | 0x02
+    return ":".join(f"{b:02x}" for b in octets)
 
 
 # pasta maps the user to root in the session's user namespace. libdbus sends
