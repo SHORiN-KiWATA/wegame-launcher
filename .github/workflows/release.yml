@@ -1,0 +1,83 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.kind }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { kind: deb,  image: 'debian:13' }
+          - { kind: rpm,  image: 'fedora:43' }
+          - { kind: arch, image: 'archlinux:latest' }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install packaging tools
+        run: sh packaging/ci-deps.sh ${{ matrix.kind }}
+
+      - name: Determine version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=0.0.0+git${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build package
+        shell: bash
+        run: bash packaging/build.sh ${{ matrix.kind }} "$VERSION"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pkg-${{ matrix.kind }}
+          path: dist/*
+
+  test:
+    name: test (${{ matrix.label }})
+    needs: build
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: debian13,    image: 'debian:13',        kind: deb }
+          - { label: ubuntu24.04, image: 'ubuntu:24.04',     kind: deb }
+          - { label: fedora43,    image: 'fedora:43',        kind: rpm }
+          - { label: archlinux,   image: 'archlinux:latest', kind: arch }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: pkg-${{ matrix.kind }}
+          path: dist
+
+      - name: Install and smoke-test
+        run: sh packaging/smoke-test.sh ${{ matrix.kind }}
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
