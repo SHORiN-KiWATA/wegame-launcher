@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-only
-"""Install and run Tencent WeGame in its own DW-Proton prefix.
+"""Install and run Tencent WeGame in its own Proton prefix.
 
-Reuses a Proton already on the machine (Steam, dwproton-bin, Lutris, ...) and
-downloads DW-Proton only when none is found. Everything lives in
+Uses WE-Proton (https://github.com/SHORiN-KiWATA/we-proton), a Proton fork that
+fixes WeGame's problems under Wine: the newest one found on the machine, or a
+download of the latest release when there is none. Any other Proton can still
+be picked by hand. Everything lives in
 ~/.wegame-launcher (runner, tools, prefix, update backups); downloads and logs
 go to ~/.cache/wegame-launcher. Without arguments a GTK window opens; see
 `wegame-launcher --help` for the command line.
@@ -48,10 +50,10 @@ STALL_SECONDS = 120
 RETRIES = 5  # connection resets are common on long cross-border downloads
 USER_AGENT = "wegame-launcher"
 
-RUNNER_DIR = ROOT / "runner"  # DW-Proton downloaded by us
+RUNNER_DIR = ROOT / "runner"  # WE-Proton downloaded by us
 TOOLS_DIR = ROOT / "tools"
 CONFIG = ROOT / "config.json"
-DW_RELEASE_API = "https://dawn.wine/api/v1/repos/dawn-winery/dwproton/releases/latest"
+WE_RELEASE_API = "https://api.github.com/repos/SHORiN-KiWATA/we-proton/releases/latest"
 
 # Official static 7-Zip, used only when the system has no 7z.
 SEVENZIP_URL = "https://www.7-zip.org/a/7z2603-linux-x64.tar.xz"
@@ -270,21 +272,21 @@ def find_runners():
     return found
 
 
-def is_dwproton(label):
-    return "dwproton" in label.lower().replace("-", "")
+def is_weproton(label):
+    return label.lower().replace("-", "").startswith("weproton")
 
 
 def auto_runner():
-    """The newest DW-Proton found anywhere, or None."""
-    dw = {label: path for label, path in find_runners().items() if is_dwproton(label)}
-    if not dw:
+    """The newest WE-Proton found anywhere, or None."""
+    we = {label: path for label, path in find_runners().items() if is_weproton(label)}
+    if not we:
         return None
-    return dw[max(dw, key=version_key)]
+    return we[max(we, key=version_key)]
 
 
 def current_runner():
     """The proton to use: WEGAME_LAUNCHER_PROTON, the user's pick, or the
-    newest DW-Proton found. None when nothing usable is installed."""
+    newest WE-Proton found. None when nothing usable is installed."""
     override = os.environ.get("WEGAME_LAUNCHER_PROTON")
     if override:
         return Path(override) if Path(override).is_file() else None
@@ -306,19 +308,19 @@ def runner_name():
     return runner_label(proton) if proton else "-"
 
 
-def download_dwproton(progress=_quiet):
-    """Download the latest DW-Proton into ~/.wegame-launcher/runner."""
-    progress(tr("正在查询 DW-Proton 最新版本…", "Looking up the latest DW-Proton…"), None)
+def download_weproton(progress=_quiet):
+    """Download the latest WE-Proton release into ~/.wegame-launcher/runner."""
+    progress(tr("正在查询 WE-Proton 最新版本…", "Looking up the latest WE-Proton…"), None)
     try:
-        release = http_json(DW_RELEASE_API)
+        release = http_json(WE_RELEASE_API)
     except (OSError, ValueError) as exc:
-        raise LauncherError(tr(f"无法获取 DW-Proton 版本信息：{exc}", f"Cannot fetch DW-Proton release info: {exc}"))
+        raise LauncherError(tr(f"无法获取 WE-Proton 版本信息：{exc}", f"Cannot fetch WE-Proton release info: {exc}"))
     tag = release["tag_name"]
     assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
-    archive = next((n for n in assets if n.endswith("x86_64.tar.xz")), None)
-    checksum = next((n for n in assets if n.endswith("x86_64.sha512sum")), None)
-    if not archive or not checksum:
-        raise LauncherError(tr(f"{tag} 缺少 x86_64 压缩包或校验文件", f"{tag} has no x86_64 archive or checksum"))
+    # Releases carry <tag>.tar.xz, <tag>.sha512sum and the matching <tag>-source.tar.xz.
+    archive, checksum = f"{tag}.tar.xz", f"{tag}.sha512sum"
+    if archive not in assets or checksum not in assets:
+        raise LauncherError(tr(f"{tag} 缺少压缩包或校验文件", f"{tag} has no archive or checksum"))
     if (RUNNER_DIR / tag / "proton").is_file():
         return RUNNER_DIR / tag / "proton"
 
@@ -326,10 +328,10 @@ def download_dwproton(progress=_quiet):
     try:
         expected = http_get(assets[checksum]).decode().split()[0]
     except OSError as exc:
-        raise LauncherError(tr(f"无法获取 DW-Proton 校验值：{exc}", f"Cannot fetch the DW-Proton checksum: {exc}"))
-    if file_digest(tarball, "sha512", tr("校验 DW-Proton…", "Verifying DW-Proton…"), progress) != expected:
+        raise LauncherError(tr(f"无法获取 WE-Proton 校验值：{exc}", f"Cannot fetch the WE-Proton checksum: {exc}"))
+    if file_digest(tarball, "sha512", tr("校验 WE-Proton…", "Verifying WE-Proton…"), progress) != expected:
         tarball.unlink()
-        raise LauncherError(tr("DW-Proton 校验失败，已删除，请重试", "DW-Proton checksum mismatch; removed, please retry"))
+        raise LauncherError(tr("WE-Proton 校验失败，已删除，请重试", "WE-Proton checksum mismatch; removed, please retry"))
 
     staging = RUNNER_DIR / f".{tag}.tmp"
     shutil.rmtree(staging, ignore_errors=True)
@@ -341,7 +343,7 @@ def download_dwproton(progress=_quiet):
             progress(tr(f"解压 {tag}…", f"Extracting {tag}…"), raw.tell() / size)
     proton = next(staging.glob("*/proton"), None)
     if proton is None:
-        raise LauncherError(tr("DW-Proton 压缩包里没有 proton", "No proton script in the DW-Proton archive"))
+        raise LauncherError(tr("WE-Proton 压缩包里没有 proton", "No proton script in the WE-Proton archive"))
     shutil.rmtree(RUNNER_DIR / tag, ignore_errors=True)
     proton.parent.rename(RUNNER_DIR / tag)
     shutil.rmtree(staging)
@@ -354,11 +356,11 @@ def download_dwproton(progress=_quiet):
 
 
 def ensure_runner(progress=_quiet):
-    return current_runner() or download_dwproton(progress)
+    return current_runner() or download_weproton(progress)
 
 
 def choose_runner(choice):
-    """Remember a Proton by label or path; "auto" goes back to the newest DW-Proton."""
+    """Remember a Proton by label or path; "auto" goes back to the newest WE-Proton."""
     if choice == "auto":
         save_config(runner=None)
         return
@@ -1218,7 +1220,7 @@ def run_gui():
             content.append(card("Proton", [
                 settings_row(tr("运行器", "Runner"), None, self.runner_dropdown),
                 settings_row(tr("WoW64 模式", "WoW64 mode"), tr("不需要 32 位系统库", "No 32-bit system libraries needed"), self.wow64_switch),
-                settings_row("DW-Proton", tr("下载最新版本", "Get the latest release"), download),
+                settings_row("WE-Proton", tr("下载最新版本", "Get the latest release"), download),
             ]))
 
             # Overlays and compositor
@@ -1264,7 +1266,7 @@ def run_gui():
             """Fill the settings page from config; Protons are rescanned each time."""
             self.loading = True
             self.runners = [None, *find_runners().values()]
-            labels = [tr("自动（最新的 DW-Proton）", "Auto (newest DW-Proton)"),
+            labels = [tr("自动（最新的 WE-Proton）", "Auto (newest WE-Proton)"),
                       *(runner_label(p) for p in self.runners[1:])]
             self.runner_dropdown.set_model(Gtk.StringList.new(labels))
             picked = load_config().get("runner")
@@ -1584,10 +1586,12 @@ def run_gui():
                     self.set_status(tr(f"将使用 {runner_name()}，并下载 WeGame 官方离线安装包",
                                        f"Uses {runner_name()} and downloads the official WeGame offline package"))
                 else:
-                    self.set_status(tr("将下载 DW-Proton 和 WeGame 官方离线安装包",
-                                       "Downloads DW-Proton and the official WeGame offline package"))
+                    self.set_status(tr("将下载 WE-Proton 和 WeGame 官方离线安装包",
+                                       "Downloads WE-Proton and the official WeGame offline package"))
             elif running:
                 self.set_status(tr("WeGame 运行中", "WeGame is running"))
+            elif not current_runner():
+                self.set_status(tr("启动时会先下载 WE-Proton", "WE-Proton will be downloaded on start"))
             else:
                 extras = [name for name, on in (("Gamescope", gamescope_settings()["enabled"]),
                                                 ("MangoHud", load_config().get("mangohud"))) if on]
@@ -1606,7 +1610,9 @@ def run_gui():
                 self.progress.set_fraction(fraction)
             return False
 
-        def start_task(self, task):
+        def start_task(self, task, then=None):
+            """Run task(progress) in a thread; call then() afterwards if it succeeded."""
+            self.after_task = then
             self.show_main()
             self.busy = True
             self.error = None
@@ -1642,10 +1648,21 @@ def run_gui():
             if error:
                 self.install_button.set_label(tr("重试", "Retry"))
             self.refresh()
+            then, self.after_task = self.after_task, None
+            if then and not error:
+                then()
             return False
 
         # --------------------------------------------------------- actions
-        def on_launch(self, *_):
+        def on_launch(self, *_, fetched=False):
+            if current_runner() is None:
+                if fetched:  # e.g. WEGAME_LAUNCHER_PROTON points nowhere
+                    self.launch_failed(tr("没有可用的 Proton", "No usable Proton"))
+                    return
+                # The Proton WeGame was installed with is gone, or it was installed
+                # before the switch to WE-Proton: fetch WE-Proton, then start.
+                self.start_task(ensure_runner, then=lambda: self.on_launch(fetched=True))
+                return
             self.error = None
             self.launch_button.set_sensitive(False)
             self.set_status(tr("正在启动 WeGame…", "Starting WeGame…"))
@@ -1693,7 +1710,7 @@ def run_gui():
 
         def on_download_runner(self, *_):
             def task(progress):
-                download_dwproton(progress)
+                download_weproton(progress)
                 save_config(runner=None)
             self.start_task(task)
 
@@ -1734,8 +1751,8 @@ def cli_progress():
 def main():
     parser = argparse.ArgumentParser(
         prog="wegame-launcher",
-        description=tr("在独立的 DW-Proton 前缀里安装和运行 WeGame。不带参数时打开图形界面。",
-                       "Install and run WeGame in its own DW-Proton prefix. Opens the GUI without arguments."),
+        description=tr("用 WE-Proton 在独立的前缀里安装和运行 WeGame。不带参数时打开图形界面。",
+                       "Install and run WeGame with WE-Proton in its own prefix. Opens the GUI without arguments."),
     )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("install", help=tr("下载 WeGame 并配置前缀", "download WeGame and set up the prefix"))
@@ -1765,10 +1782,10 @@ def main():
     logs.add_argument("--winedebug", metavar=tr("通道", "CHANNELS"),
                       help=tr("Proton 日志的 WINEDEBUG，空字符串表示 Proton 默认", "WINEDEBUG for the Proton log; empty for Proton's default"))
     runner = sub.add_parser("runner", help=tr("列出或选择 Proton", "list or choose the Proton"),
-                            description=tr("不带参数列出电脑上找到的 Proton；auto 表示自动用最新的 DW-Proton。",
-                                           "Without arguments, list the Protons found; auto picks the newest DW-Proton."))
+                            description=tr("不带参数列出电脑上找到的 Proton；auto 表示自动用最新的 WE-Proton。",
+                                           "Without arguments, list the Protons found; auto picks the newest WE-Proton."))
     runner.add_argument("choice", nargs="?", metavar=tr("auto|名称|路径", "auto|NAME|PATH"))
-    runner.add_argument("--download", action="store_true", help=tr("下载最新 DW-Proton", "download the latest DW-Proton"))
+    runner.add_argument("--download", action="store_true", help=tr("下载最新 WE-Proton", "download the latest WE-Proton"))
     # The .desktop file hands wegame:// links over as a bare argument.
     argv = sys.argv[1:]
     if argv and argv[0].lower().startswith("wegame:"):
@@ -1783,7 +1800,7 @@ def main():
         if options.command == "install":
             install(cli_progress())
         elif options.command == "run":
-            if not is_installed():
+            if not is_installed() or current_runner() is None:
                 install(cli_progress())
             return run_supervised(options.args, lambda message: print(message, file=sys.stderr))
         elif options.command == "kill":
@@ -1836,7 +1853,7 @@ def main():
                 print(f"{human_size(stat.st_size):>10}  {datetime.fromtimestamp(stat.st_mtime):%m-%d %H:%M}  {path}  {title}")
         elif options.command == "runner":
             if options.download:
-                download_dwproton(cli_progress())
+                download_weproton(cli_progress())
                 save_config(runner=None)
             elif options.choice:
                 choose_runner(options.choice)
@@ -1844,7 +1861,7 @@ def main():
             for label, path in find_runners().items():
                 print(f"{'*' if path == picked else ' '} {label:<28} {path}")
             if not load_config().get("runner"):
-                print(tr("（自动：使用最新的 DW-Proton）", "(auto: newest DW-Proton)"))
+                print(tr("（自动：使用最新的 WE-Proton）", "(auto: newest WE-Proton)"))
         elif options.command == "status":
             print(f"root:    {ROOT}")
             proton = current_runner()
