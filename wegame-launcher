@@ -572,6 +572,10 @@ def proton_env():
     # crashes outright when e.g. 32-bit libgcc_s is missing.
     if load_config().get("wow64", True):
         env.setdefault("PROTON_USE_WOW64", "1")
+    # GE-Proton based runners start xalia (controller navigation through
+    # accessibility queries) for every program; WeGame's Chromium UI thread
+    # hangs answering its queries, and nobody steers WeGame with a controller.
+    env.setdefault("PROTON_USE_XALIA", "0")
     if network_namespace_enabled():
         # The namespace gives the session CAP_NET_ADMIN in its own user
         # namespace, so WE-Proton's builtin wintun can create a TUN adapter;
