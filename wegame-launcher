@@ -1183,7 +1183,11 @@ def launch(args=()):
         recover_updates()
     LOGS.mkdir(parents=True, exist_ok=True)
     log = open(LOGS / "wegame.log", "a")
-    command = [*network_namespace_command(), *gamescope_command(),
+    # gamescope goes outside the namespace: inside it the user is root and
+    # the real root unmapped, so /tmp/.X11-unix looks owned by nobody and
+    # gamescope refuses to start its Xwayland. The session still reaches that
+    # Xwayland through the socket file; the abstract one is per namespace.
+    command = [*gamescope_command(), *network_namespace_command(),
                *proton_command("waitforexitandrun", str(CLIENT), *args)]
     log.write(f"\n--- {datetime.now():%F %T} launch: {shlex.join(command)}\n")
     log.flush()
