@@ -13,6 +13,8 @@ and logs go to ~/.cache/wegame-launcher. Without arguments a GTK window opens; s
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import fcntl
 import hashlib
 import ipaddress
@@ -923,7 +925,7 @@ def gamescope_command():
         command += shlex.split(settings["args"])
     except ValueError as exc:
         raise LauncherError(tr(f"Gamescope 参数有误：{exc}", f"Invalid Gamescope arguments: {exc}"))
-    return command + ["--"]
+    return command + ["--", sys.executable, os.path.realpath(__file__), GAMESCOPE_SESSION_ARG, "--"]
 
 
 def network_namespace_enabled():
@@ -1175,6 +1177,156 @@ def bus_bridge(command):
         if server:
             server.close()
             bridge.unlink(missing_ok=True)
+
+
+# gamescope runs its own Xwayland, which the desktop's input method is not
+# connected to, so nothing could be typed in Chinese there. The helper gamescope
+# starts asks fcitx5 to serve that display as well. fcitx5's candidate window
+# on it belongs to another process, and gamescope only shows popups of the
+# focused app, so a watcher tags it with the focused window as its STEAM_GAME,
+# which gamescope takes as the app it belongs to. It is also marked layered and
+# transparent the way Wine marks windows: gamescope then paints it on top as a
+# decoration instead of handing it the keyboard as a popup, which lost the
+# release of the key that switched the input method (Super stayed down).
+GAMESCOPE_SESSION_ARG = "--in-gamescope"
+IME_WATCH_ARG = "--ime-watch"
+
+
+def follow_input_method(display):
+    """Have the session's fcitx5 serve display too, now and whenever it
+    (re)starts, from a background thread. False without a session bus."""
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception as exc:  # no gi, no bus
+        print(f"wegame-launcher: no input method in gamescope: {exc}", file=sys.stderr)
+        return False
+
+    def open_display():
+        try:
+            bus.call_sync("org.fcitx.Fcitx5", "/controller", "org.fcitx.Fcitx.Controller1", "OpenX11Connection",
+                          GLib.Variant("(s)", (display,)), None, Gio.DBusCallFlags.NO_AUTO_START, 5000, None)
+        except GLib.Error as exc:  # e.g. an fcitx5 without the method
+            print(f"wegame-launcher: fcitx5 cannot serve {display}: {exc.message}", file=sys.stderr)
+
+    def owner_changed(_bus, _sender, _path, _interface, _signal, parameters):
+        if parameters.unpack()[2]:  # a new fcitx5 knows nothing about this display
+            open_display()
+
+    bus.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus",
+                         "org.fcitx.Fcitx5", Gio.DBusSignalFlags.NONE, owner_changed)
+    threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
+    # never NO_AUTO_START-less calls here: they would have the bus start an
+    # fcitx5 the desktop doesn't run
+    owned, = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner",
+                           GLib.Variant("(s)", ("org.fcitx.Fcitx5",)), GLib.VariantType("(b)"),
+                           Gio.DBusCallFlags.NONE, 2000, None).unpack()
+    if owned:
+        open_display()
+    return True
+
+
+def tag_input_method_windows(display):
+    """Until display goes away, give fcitx5's windows on it the STEAM_GAME of
+    gamescope's focused window."""
+    x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+    ulong, voidp = ctypes.c_ulong, ctypes.c_void_p
+    x11.XOpenDisplay.restype = voidp
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultRootWindow.restype = ulong
+    x11.XDefaultRootWindow.argtypes = [voidp]
+    x11.XInternAtom.restype = ulong
+    x11.XInternAtom.argtypes = [voidp, ctypes.c_char_p, ctypes.c_int]
+    x11.XSelectInput.argtypes = [voidp, ulong, ctypes.c_long]
+    x11.XNextEvent.argtypes = [voidp, voidp]
+    x11.XGetClassHint.argtypes = [voidp, ulong, voidp]
+    x11.XFree.argtypes = [voidp]
+    x11.XGetWindowProperty.argtypes = [voidp, ulong, ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int, ulong,
+                                       voidp, voidp, voidp, voidp, voidp]
+    x11.XChangeProperty.argtypes = [voidp, ulong, ulong, ulong, ctypes.c_int, ctypes.c_int, voidp, ctypes.c_int]
+    x11.XFlush.argtypes = [voidp]
+
+    # windows can go away between an event and our request: ignore the errors,
+    # and leave quietly once gamescope is gone
+    on_error = ctypes.CFUNCTYPE(ctypes.c_int, voidp, voidp)(lambda *_: 0)
+    on_io_error = ctypes.CFUNCTYPE(ctypes.c_int, voidp)(lambda _: os._exit(0))
+    x11.XSetErrorHandler(on_error)
+    x11.XSetIOErrorHandler(on_io_error)
+
+    class ClassHint(ctypes.Structure):
+        _fields_ = [("res_name", voidp), ("res_class", voidp)]
+
+    dpy = x11.XOpenDisplay(display.encode())
+    if not dpy:
+        return
+    root = x11.XDefaultRootWindow(dpy)
+    steam_game = x11.XInternAtom(dpy, b"STEAM_GAME", 0)
+    ex_style = x11.XInternAtom(dpy, b"_WINE_HWND_EXSTYLE", 0)
+    focused = x11.XInternAtom(dpy, b"GAMESCOPE_FOCUSED_WINDOW", 0)
+    cardinal = 6  # XA_CARDINAL
+    x11.XSelectInput(dpy, root, (1 << 19) | (1 << 22))  # SubstructureNotify, PropertyChange
+
+    def focused_window():
+        kind, fmt, count, after, data = ulong(), ctypes.c_int(), ulong(), ulong(), ctypes.POINTER(ctypes.c_long)()
+        if x11.XGetWindowProperty(dpy, root, focused, 0, 1, 0, cardinal, ctypes.byref(kind), ctypes.byref(fmt),
+                                  ctypes.byref(count), ctypes.byref(after), ctypes.byref(data)) or not data:
+            return 0
+        value = data[0] if count.value else 0
+        x11.XFree(data)
+        return value & 0xffffffff
+
+    def is_input_method(window):
+        hint = ClassHint()
+        if not x11.XGetClassHint(dpy, window, ctypes.byref(hint)):
+            return False
+        found = bool(hint.res_class) and ctypes.string_at(hint.res_class).lower() == b"fcitx"
+        for pointer in (hint.res_name, hint.res_class):
+            if pointer:
+                x11.XFree(pointer)
+        return found
+
+    def tag(window, app):
+        for prop, value in ((ex_style, 0x80000 | 0x20), (steam_game, app)):  # WS_EX_LAYERED | WS_EX_TRANSPARENT
+            value = ctypes.c_long(value)
+            x11.XChangeProperty(dpy, window, prop, cardinal, 32, 0, ctypes.byref(value), 1)  # PropModeReplace
+
+    windows = set()
+    event = (ctypes.c_long * 24)()  # XEvent; fields read by their offset on 64-bit
+    while True:
+        x11.XNextEvent(dpy, event)
+        kind = event[0] & 0xffffffff
+        if kind == 19:  # MapNotify: window at 40
+            window = event[5] & 0xffffffff
+            if window in windows or is_input_method(window):
+                windows.add(window)
+                if app := focused_window():
+                    tag(window, app)
+        elif kind == 17:  # DestroyNotify: window at 40
+            windows.discard(event[5] & 0xffffffff)
+        elif kind == 28 and event[5] == focused and windows:  # PropertyNotify: atom at 40
+            if app := focused_window():
+                for window in windows:
+                    tag(window, app)
+        x11.XFlush(dpy)
+
+
+def gamescope_session(command):
+    """Run command in gamescope with the desktop's input method reaching it,
+    and return its exit status."""
+    display = os.environ.get("DISPLAY")
+    watcher = None
+    if display and follow_input_method(display):
+        watcher = subprocess.Popen([sys.executable, os.path.realpath(__file__), IME_WATCH_ARG, display])
+    child = subprocess.Popen(command)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _: child.send_signal(signum))
+    try:
+        return child.wait()
+    finally:
+        if watcher:
+            watcher.terminate()
 
 
 def launch(args=()):
@@ -2272,6 +2424,14 @@ def cli_progress():
 
 
 def main():
+    if sys.argv[1:2] == [GAMESCOPE_SESSION_ARG]:  # started by gamescope
+        command = sys.argv[2:]
+        if command[:1] == ["--"]:
+            command = command[1:]
+        sys.exit(gamescope_session(command))
+    if sys.argv[1:2] == [IME_WATCH_ARG] and len(sys.argv) == 3:
+        tag_input_method_windows(sys.argv[2])
+        sys.exit(0)
     if sys.argv[1:2] == [BUS_BRIDGE_ARG]:  # inside the session's network namespace
         command = sys.argv[2:]
         if command[:1] == ["--"]:
