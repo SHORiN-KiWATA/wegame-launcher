@@ -1197,6 +1197,14 @@ def launch(args=()):
         if not shutil.which("mangohud"):
             raise LauncherError(tr("已开启 MangoHud，但没有安装 mangohud", "MangoHud is enabled but not installed"))
         env["MANGOHUD"] = "1"  # DXVK's Vulkan picks up the MangoHud layer
+    # Wine's own Wayland driver instead of X11 through Xwayland. It is
+    # chosen for the whole session (WeGame and the games), and gamescope
+    # only offers X11. Games see other display devices under it, which to
+    # anti-cheat may look like a changed machine when switching back and forth.
+    if load_config().get("wayland") and not gamescope_settings()["enabled"]:
+        if not env.get("WAYLAND_DISPLAY"):
+            raise LauncherError(tr("已开启 Wayland，但当前不是 Wayland 会话", "Wayland is enabled but this is not a Wayland session"))
+        env["PROTON_ENABLE_WAYLAND"] = "1"
     with log:
         return subprocess.Popen(command, env=env, cwd=INSTALL_DIR, stdout=log, stderr=log,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
@@ -1652,6 +1660,8 @@ def run_gui():
             # Overlays and compositor
             self.mangohud_switch = Gtk.Switch()
             self.mangohud_switch.connect("notify::active", lambda s, _: save_config(mangohud=s.get_active()))
+            self.wayland_switch = Gtk.Switch()
+            self.wayland_switch.connect("notify::active", lambda s, _: save_config(wayland=s.get_active()))
             self.gs_switch = Gtk.Switch()
             self.gs_switch.connect("notify::active", self.on_gamescope_toggled)
             self.gs_fullscreen = Gtk.Switch()
@@ -1672,9 +1682,12 @@ def run_gui():
                 settings_row(tr("附加参数", "Extra arguments"), None, self.gs_args),
             ]
             self.mangohud_row = settings_row("MangoHud", tr("性能叠加层", "Performance overlay"), self.mangohud_switch)
+            self.wayland_row = settings_row("Wayland", tr("用 Wine 的 Wayland 驱动（实验性）；开关前后游戏看到的显示设备不同",
+                                                          "Use Wine's Wayland driver (experimental); games see other display devices"),
+                                            self.wayland_switch)
             self.gs_row = settings_row("Gamescope", tr("在独立的合成器里运行，可解决窗口异常",
                                                       "Run nested in its own compositor; fixes window glitches"), self.gs_switch)
-            content.append(card(tr("显示", "Display"), [self.mangohud_row, self.gs_row, *self.gs_rows]))
+            content.append(card(tr("显示", "Display"), [self.mangohud_row, self.wayland_row, self.gs_row, *self.gs_rows]))
 
             # Maintenance
             reinstall_button = Gtk.Button(label=tr("重装", "Reinstall"), css_classes=["compact-button"])
@@ -1710,6 +1723,10 @@ def run_gui():
             self.mangohud_switch.set_active(bool(config.get("mangohud")) and has_mangohud)
             self.mangohud_row.set_sensitive(has_mangohud)
             self.mangohud_row.set_tooltip_text(None if has_mangohud else tr("没有安装 mangohud", "mangohud is not installed"))
+            on_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+            self.wayland_switch.set_active(bool(config.get("wayland")) and on_wayland)
+            self.wayland_row.set_sensitive(on_wayland)
+            self.wayland_row.set_tooltip_text(None if on_wayland else tr("当前不是 Wayland 会话", "This is not a Wayland session"))
 
             gs = gamescope_settings()
             has_gamescope = shutil.which("gamescope") is not None
@@ -2027,6 +2044,7 @@ def run_gui():
                 self.set_status(tr("启动时会先下载 Steam 运行时", "The Steam Linux Runtime will be downloaded on start"))
             else:
                 extras = [name for name, on in (("Gamescope", gamescope_settings()["enabled"]),
+                                                ("Wayland", load_config().get("wayland") and not gamescope_settings()["enabled"]),
                                                 ("MangoHud", load_config().get("mangohud"))) if on]
                 self.set_status(" · ".join([f"WeGame {client_version() or '?'}", runner_name(), *extras]))
             return True
@@ -2217,6 +2235,13 @@ def main():
     gs.add_argument("--args", metavar=tr("参数", "ARGS"), help=tr("追加的 gamescope 参数，写成 --args='--xxx'", "extra gamescope arguments, written as --args='--xxx'"))
     mangohud = sub.add_parser("mangohud", help=tr("MangoHud 性能叠加层", "MangoHud performance overlay"))
     mangohud.add_argument("state", nargs="?", choices=["on", "off"])
+    wayland = sub.add_parser("wayland", help=tr("用 Wine 的 Wayland 驱动（实验性，默认关闭）", "Wine's Wayland driver (experimental; off by default)"),
+                             description=tr("整个会话（WeGame 和游戏）改用 Wine 的 Wayland 驱动，不再经过 Xwayland。开着 Gamescope 时不生效。"
+                                            "游戏看到的显示设备会和 X11 下不同，带反作弊的游戏来回切换可能被当成改了机器。",
+                                            "The whole session (WeGame and the games) uses Wine's Wayland driver instead of Xwayland. "
+                                            "No effect while Gamescope is on. Games see other display devices than under X11; "
+                                            "with anti-cheat, switching back and forth may look like a changed machine."))
+    wayland.add_argument("state", nargs="?", choices=["on", "off"])
     wow64 = sub.add_parser("wow64", help=tr("WoW64 模式（默认开启，无需 32 位库）", "WoW64 mode (on by default; no 32-bit libraries needed)"))
     wow64.add_argument("state", nargs="?", choices=["on", "off"])
     netns = sub.add_parser("netns", help=tr("独立网络命名空间（默认关闭，需要 passt）",
@@ -2289,6 +2314,10 @@ def main():
             if options.state:
                 save_config(mangohud=options.state == "on")
             print("mangohud", "on" if load_config().get("mangohud") else "off")
+        elif options.command == "wayland":
+            if options.state:
+                save_config(wayland=options.state == "on")
+            print("wayland", "on" if load_config().get("wayland") else "off")
         elif options.command == "wow64":
             if options.state:
                 save_config(wow64=options.state == "on")
@@ -2341,6 +2370,7 @@ def main():
             appid = runtime_wanted(proton) if proton else None
             print(f"runtime: {(find_runtime(appid) or '-') if appid else tr('不使用', 'not used')}")
             print(f"netns:   {'on' if network_namespace_enabled() else 'off'}")
+            print(f"wayland: {'on' if load_config().get('wayland') else 'off'}")
             print(f"wegame:  {client_version() or '-'}")
             print(f"running: {', '.join(map(str, prefix_pids())) or '-'}")
             print(f"logs:    {LOGS}")
