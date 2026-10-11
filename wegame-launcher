@@ -15,6 +15,7 @@ and logs go to ~/.cache/wegame-launcher. Without arguments a GTK window opens; s
 import argparse
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -969,6 +970,48 @@ def namespace_mac_address():
     octets = bytearray(hashlib.sha256(b"wegame-launcher netns " + seed).digest()[:6])
     octets[0] = (octets[0] & 0xfc) | 0x02
     return ":".join(f"{b:02x}" for b in octets)
+
+
+def pin_name_server_routes():
+    """Inside the namespace, before the session starts: give every name
+    server a host route through the adapter it is reached by now. An
+    accelerator in TUN mode routes everything into its adapter and sends the
+    lookups for game domains through its node, where each one takes one of
+    the user's UDP sessions. The node stops answering new sessions past a few
+    hundred, a game that pings all its data centres gets there, the lookups
+    time out and are retried, and the game cannot reach its servers
+    (Valorant: VAL 43, or stuck loading a match). With these routes lookups
+    go out as without the accelerator; everything else still goes through it.
+    Only the namespace's own routes change, so no privileges are needed."""
+    ip = shutil.which("ip")
+    try:
+        lines = Path("/etc/resolv.conf").read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        fields = line.split()
+        if fields[:1] != ["nameserver"] or len(fields) < 2 or not ip:
+            continue
+        try:
+            server = ipaddress.ip_address(fields[1].partition("%")[0])
+        except ValueError:
+            continue
+        if server.is_loopback or server.is_link_local:
+            continue  # never routed into an adapter
+        family = "-6" if server.version == 6 else "-4"
+        try:
+            route = json.loads(subprocess.run([ip, "-j", family, "route", "get", str(server)],
+                                              capture_output=True, text=True).stdout or "[]")[0]
+        except (ValueError, IndexError):
+            continue
+        if route.get("dev") in (None, "lo"):
+            continue
+        command = [ip, family, "route", "replace", f"{server}/{server.max_prefixlen}", "dev", route["dev"]]
+        if route.get("gateway"):
+            command[5:5] = ["via", route["gateway"]]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            print(f"wegame-launcher: {shlex.join(command)}: {result.stderr.strip()}", file=sys.stderr)
 
 
 # pasta maps the user to root in the session's user namespace. libdbus sends
@@ -2144,6 +2187,7 @@ def main():
         command = sys.argv[2:]
         if command[:1] == ["--"]:
             command = command[1:]
+        pin_name_server_routes()
         sys.exit(bus_bridge(command))
     parser = argparse.ArgumentParser(
         prog="wegame-launcher",
