@@ -1642,6 +1642,12 @@ def run_gui():
             self.runtime_switch.connect("notify::active", lambda s, _: save_config(steam_runtime=s.get_active()))
             self.netns_switch = Gtk.Switch()
             self.netns_switch.connect("notify::active", lambda s, _: save_config(network_namespace=s.get_active()))
+            self.wayland_switch = Gtk.Switch()
+            self.wayland_switch.connect("notify::active", lambda s, _: save_config(wayland=s.get_active()))
+            self.wayland_row = settings_row(tr("以 Wayland 运行", "Run under Wayland"),
+                                            tr("用 Wine 的 Wayland 驱动（实验性）；开关前后游戏看到的显示设备不同",
+                                               "Use Wine's Wayland driver (experimental); games see other display devices"),
+                                            self.wayland_switch)
             self.netns_row = settings_row(
                 tr("独立网络命名空间", "Separate network namespace"),
                 tr("让加速器、VPN 能建虚拟网卡（需要 passt）",
@@ -1649,6 +1655,7 @@ def run_gui():
                 self.netns_switch)
             content.append(card("Proton", [
                 settings_row(tr("运行器", "Runner"), None, self.runner_dropdown),
+                self.wayland_row,
                 settings_row(tr("Steam 运行时", "Steam Linux Runtime"),
                              tr("在 Proton 要求的容器里运行；关掉后视频、音频解码等会缺库", "Run in the container Proton is built for; without it e.g. media decoding lacks libraries"),
                              self.runtime_switch),
@@ -1660,8 +1667,6 @@ def run_gui():
             # Overlays and compositor
             self.mangohud_switch = Gtk.Switch()
             self.mangohud_switch.connect("notify::active", lambda s, _: save_config(mangohud=s.get_active()))
-            self.wayland_switch = Gtk.Switch()
-            self.wayland_switch.connect("notify::active", lambda s, _: save_config(wayland=s.get_active()))
             self.gs_switch = Gtk.Switch()
             self.gs_switch.connect("notify::active", self.on_gamescope_toggled)
             self.gs_fullscreen = Gtk.Switch()
@@ -1682,12 +1687,9 @@ def run_gui():
                 settings_row(tr("附加参数", "Extra arguments"), None, self.gs_args),
             ]
             self.mangohud_row = settings_row("MangoHud", tr("性能叠加层", "Performance overlay"), self.mangohud_switch)
-            self.wayland_row = settings_row("Wayland", tr("用 Wine 的 Wayland 驱动（实验性）；开关前后游戏看到的显示设备不同",
-                                                          "Use Wine's Wayland driver (experimental); games see other display devices"),
-                                            self.wayland_switch)
             self.gs_row = settings_row("Gamescope", tr("在独立的合成器里运行，可解决窗口异常",
                                                       "Run nested in its own compositor; fixes window glitches"), self.gs_switch)
-            content.append(card(tr("显示", "Display"), [self.mangohud_row, self.wayland_row, self.gs_row, *self.gs_rows]))
+            content.append(card(tr("显示", "Display"), [self.mangohud_row, self.gs_row, *self.gs_rows]))
 
             # Maintenance
             reinstall_button = Gtk.Button(label=tr("重装", "Reinstall"), css_classes=["compact-button"])
