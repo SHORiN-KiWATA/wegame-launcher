@@ -330,6 +330,11 @@ def runner_name():
     return runner_label(proton) if proton else "-"
 
 
+def latest_weproton():
+    """Tag of the latest WE-Proton release."""
+    return http_json(WE_RELEASE_API)["tag_name"]
+
+
 def download_weproton(progress=_quiet):
     """Download the latest WE-Proton release into ~/.wegame-launcher/runner."""
     progress(tr("正在查询 WE-Proton 最新版本…", "Looking up the latest WE-Proton…"), None)
@@ -1517,7 +1522,9 @@ def run_gui():
         row = Gtk.Box(spacing=12, css_classes=["settings-row"])
         labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
         labels.append(Gtk.Label(label=title, xalign=0))
-        if subtitle:
+        if isinstance(subtitle, Gtk.Widget):
+            labels.append(subtitle)
+        elif subtitle:
             labels.append(Gtk.Label(label=subtitle, xalign=0, wrap=True, css_classes=["dim"]))
         widget.set_valign(Gtk.Align.CENTER)
         row.append(labels)
@@ -1634,8 +1641,10 @@ def run_gui():
             # Proton
             self.runner_dropdown = Gtk.DropDown(hexpand=True)
             self.runner_dropdown.connect("notify::selected", self.on_runner_selected)
-            download = Gtk.Button(label=tr("下载", "Download"), css_classes=["compact-button"])
-            download.connect("clicked", self.on_download_runner)
+            self.weproton_label = Gtk.Label(xalign=0, wrap=True, css_classes=["dim"])
+            self.weproton_button = Gtk.Button(css_classes=["compact-button"])
+            self.weproton_button.connect("clicked", self.on_weproton_button)
+            self.weproton_action = None
             self.wow64_switch = Gtk.Switch()
             self.wow64_switch.connect("notify::active", lambda s, _: save_config(wow64=s.get_active()))
             self.runtime_switch = Gtk.Switch()
@@ -1661,7 +1670,7 @@ def run_gui():
                              self.runtime_switch),
                 self.netns_row,
                 settings_row(tr("WoW64 模式", "WoW64 mode"), tr("不需要 32 位系统库", "No 32-bit system libraries needed"), self.wow64_switch),
-                settings_row("WE-Proton", tr("下载最新版本", "Get the latest release"), download),
+                settings_row("WE-Proton", self.weproton_label, self.weproton_button),
             ]))
 
             # Overlays and compositor
@@ -1743,7 +1752,57 @@ def run_gui():
             for row in self.gs_rows:
                 row.set_sensitive(self.gs_switch.get_active())
             self.maintenance.set_sensitive(is_installed())
+            self.check_weproton()
             self.loading = False
+
+        def check_weproton(self, force=False):
+            """Compare the newest WE-Proton here with the latest release, in
+            the background; a result is reused for a few minutes."""
+            installed = auto_runner()
+            current = runner_label(installed) if installed else None
+            latest, checked = getattr(self, "weproton_latest", (None, 0))
+            if latest and not force and time.monotonic() - checked < 600:
+                self.show_weproton(current, latest)
+                return
+            self.weproton_label.set_label(tr("正在检查更新…", "Checking for updates…"))
+            self.weproton_button.set_visible(False)
+
+            def worker():
+                try:
+                    latest = latest_weproton()
+                except (OSError, ValueError, KeyError, TypeError):
+                    latest = None
+                GLib.idle_add(self.weproton_checked, current, latest)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def weproton_checked(self, current, latest):
+            if latest:
+                self.weproton_latest = (latest, time.monotonic())
+            self.show_weproton(current, latest)
+            return False
+
+        def show_weproton(self, current, latest):
+            # the row is titled WE-Proton already: show 11.0-14-23, not we-proton-11.0-14-23
+            have, new = (re.sub(r"(?i)^we-?proton-", "", v or "") for v in (current, latest))
+            if not latest:
+                text = tr(f"检查更新失败（当前 {have}）", f"Could not check for updates (using {have})") if current \
+                    else tr("检查更新失败", "Could not check for updates")
+                action, button = "check", tr("重试", "Retry")
+            elif not current:
+                text = tr(f"还没有安装，最新版本 {new}", f"Not installed; latest release {new}")
+                action, button = "download", tr("下载", "Download")
+            elif version_key(latest) > version_key(current):
+                text = tr(f"有新版本 {new}（当前 {have}）", f"{new} is out (using {have})")
+                action, button = "download", tr("更新", "Update")
+            else:
+                text = tr(f"已是最新（{have}）", f"Up to date ({have})")
+                action, button = None, None
+            self.weproton_label.set_label(text)
+            self.weproton_action = action
+            self.weproton_button.set_visible(action is not None)
+            if button:
+                self.weproton_button.set_label(button)
 
         def on_runner_selected(self, dropdown, _):
             if getattr(self, "loading", False):
@@ -2161,6 +2220,12 @@ def run_gui():
             self.confirm(tr("删除整个前缀并重新安装？WeGame 的登录数据会丢失。",
                             "Delete the whole prefix and install again? WeGame login data will be lost."),
                          lambda: self.start_task(rebuild))
+
+        def on_weproton_button(self, *_):
+            if self.weproton_action == "check":
+                self.check_weproton(force=True)
+            elif self.weproton_action == "download":
+                self.on_download_runner()
 
         def on_download_runner(self, *_):
             def task(progress):
