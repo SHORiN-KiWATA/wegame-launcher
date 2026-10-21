@@ -941,6 +941,16 @@ def pasta_path():
     return shutil.which("pasta")
 
 
+def pasta_pidns_options(pasta):
+    """Newer pasta starts the command in a new PID namespace unless told not
+    to; older ones never do and don't know the option."""
+    try:
+        result = subprocess.run([pasta, "--help"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return ["--no-pidns"] if "--no-pidns" in result.stdout + result.stderr else []
+
+
 def network_namespace_command():
     """pasta [options] -- prefix when the session should run in its own
     network namespace, or [] when disabled. The session then gets its own user
@@ -952,7 +962,7 @@ def network_namespace_command():
     if not (pasta := pasta_path()):
         raise LauncherError(tr("已开启独立网络命名空间，但没有安装 passt（pasta）",
                                "The separate network namespace is enabled but passt (pasta) is not installed"))
-    return [pasta, "--config-net", "--ns-mac-addr", namespace_mac_address(), "-f", "--no-pidns", "--",
+    return [pasta, "--config-net", "--ns-mac-addr", namespace_mac_address(), "-f", *pasta_pidns_options(pasta), "--",
             sys.executable, os.path.realpath(__file__), BUS_BRIDGE_ARG, "--"]
 
 
