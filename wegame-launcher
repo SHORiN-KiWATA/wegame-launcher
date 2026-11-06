@@ -941,14 +941,25 @@ def pasta_path():
     return shutil.which("pasta")
 
 
-def pasta_pidns_options(pasta):
-    """Newer pasta starts the command in a new PID namespace unless told not
-    to; older ones never do and don't know the option."""
+def pasta_version_options(pasta):
+    """Options older pasta doesn't know. Newer pasta starts the command in a
+    new PID namespace unless told not to; older ones never do.
+    Programs waiting for a browser login listen on the namespace's 127.0.0.1
+    only, but pasta hands what reaches the host's loopback to the namespace's
+    own address, and IPv6 ones to its ::1: forward IPv4 only, so the
+    browser's localhost falls back from ::1 to 127.0.0.1, and keep loopback
+    as loopback in the namespace."""
     try:
         result = subprocess.run([pasta, "--help"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return []
-    return ["--no-pidns"] if "--no-pidns" in result.stdout + result.stderr else []
+    help_text = result.stdout + result.stderr
+    options = []
+    if "--no-pidns" in help_text:
+        options.append("--no-pidns")
+    if "--host-lo-to-ns-lo" in help_text:
+        options += ["-t", "0.0.0.0/auto", "--host-lo-to-ns-lo"]
+    return options
 
 
 def network_namespace_command():
@@ -962,7 +973,7 @@ def network_namespace_command():
     if not (pasta := pasta_path()):
         raise LauncherError(tr("已开启独立网络命名空间，但没有安装 passt（pasta）",
                                "The separate network namespace is enabled but passt (pasta) is not installed"))
-    return [pasta, "--config-net", "--ns-mac-addr", namespace_mac_address(), "-f", *pasta_pidns_options(pasta), "--",
+    return [pasta, "--config-net", "--ns-mac-addr", namespace_mac_address(), "-f", *pasta_version_options(pasta), "--",
             sys.executable, os.path.realpath(__file__), BUS_BRIDGE_ARG, "--"]
 
 
